@@ -32,6 +32,11 @@
 └── CMakeLists.txt
 ```
 
+## 深度分析文档
+
+- [LBRR 深度分析](docs/LBRR_深度分析.md)
+- [DRED / PLC 深度分析](docs/DRED_PLC_深度分析.md)
+
 ## 快速开始
 
 ### 1. 编译
