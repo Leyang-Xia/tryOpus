@@ -272,6 +272,26 @@ python3 tools/analyze.py --compare results/
 
 ---
 
+## Pion WebRTC 轻量 Demo
+
+仓库新增了独立的 `webrtc_demo/` 子目录，用于快速验证 Pion WebRTC 的最小链路（浏览器 ↔ Go 服务端）：
+
+- 使用 HTTP `/offer` 完成 SDP 交换
+- 使用 DataChannel 进行双向通信和服务端回显
+- 不依赖当前 C/CMake 主工程，可单独运行
+
+快速体验：
+
+```bash
+cd webrtc_demo
+go mod tidy
+go run .
+```
+
+浏览器打开 `http://127.0.0.1:8080`，点击“连接”后即可发送消息并看到回显。
+
+---
+
 ## 依赖
 
 - Opus 1.6.1（含 DRED/OSCE/BWE）
