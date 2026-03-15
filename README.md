@@ -290,6 +290,14 @@ go run .
 
 浏览器打开 `http://127.0.0.1:8080`，点击“连接”后即可发送消息并看到回显。
 
+如果在 Cursor Cloud 中运行，建议在启动脚本执行：
+
+```bash
+bash scripts/cursor_cloud_startup.sh
+```
+
+该脚本会保证 Go `>=1.22`，并预热 `webrtc_demo` 的 Go 依赖。
+
 ---
 
 ## 依赖
