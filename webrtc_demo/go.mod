@@ -2,7 +2,10 @@ module opus_lab/webrtc_demo
 
 go 1.22
 
-require github.com/pion/webrtc/v4 v4.1.6
+require (
+	github.com/hraban/opus v0.0.0-20251117090126-c76ea7e21bf3
+	github.com/pion/webrtc/v4 v4.1.6
+)
 
 require (
 	github.com/google/uuid v1.6.0 // indirect
