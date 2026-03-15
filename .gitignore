@@ -10,9 +10,14 @@ audio/*.wav
 
 # IDE
 .vscode/
+.cache/
 *.swp
 *~
 
 # Python
 __pycache__/
 *.pyc
+
+# Opus src
+opus-src/
+opus-install/
