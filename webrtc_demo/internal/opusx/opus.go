@@ -3,7 +3,7 @@ package opusx
 /*
 #cgo pkg-config: opus
 #include <stdlib.h>
-#include <opus/opus.h>
+#include <opus.h>
 
 static int go_opus_encoder_set_bitrate(OpusEncoder *enc, int bitrate) {
 	return opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate));
