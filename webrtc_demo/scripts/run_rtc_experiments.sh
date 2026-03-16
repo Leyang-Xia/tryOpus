@@ -148,7 +148,7 @@ while IFS='|' read -r audio_type input_wav; do
   run_case "${audio_type}" "${input_wav}" "baseline_no_protection" "${sim_mode}" "${sim_loss_value}" "${sim_extra}" "--fec=false --dred=0 --plp=0" "--use-lbrr=false --use-dred=false"
   run_case "${audio_type}" "${input_wav}" "lbrr_only" "${sim_mode}" "${sim_loss_value}" "${sim_extra}" "--fec=true --dred=0 --plp=15" "--use-lbrr=true --use-dred=false"
   run_case "${audio_type}" "${input_wav}" "dred_only" "${sim_mode}" "${sim_loss_value}" "${sim_extra}" "--fec=false --dred=3 --plp=15" "--use-lbrr=false --use-dred=true"
-  run_case "${audio_type}" "${input_wav}" "lbrr_dred" "${sim_mode}" "${sim_loss_value}" "${sim_extra}" "--fec=true --dred=3 --plp=15" "--use-lbrr=true --use-dred=true"
+  run_case "${audio_type}" "${input_wav}" "lbrr_dred" "${sim_mode}" "${sim_loss_value}" "${sim_extra}" "--fec=true --dred=3 --plp=15 --bitrate=64000 --vbr=true" "--use-lbrr=true --use-dred=true"
 done < "${AUDIO_MANIFEST}"
 
 echo "[exp] done"
