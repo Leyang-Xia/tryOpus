@@ -16,8 +16,9 @@ webrtc_demo/
 ## 依赖准备（本地 Opus + DRED）
 
 ```bash
-export PKG_CONFIG_PATH=/workspace/opus-install/lib/pkgconfig:${PKG_CONFIG_PATH}
-export LD_LIBRARY_PATH=/workspace/opus-install/lib:${LD_LIBRARY_PATH}
+ROOT_DIR=$(pwd)
+export PKG_CONFIG_PATH=${ROOT_DIR}/../opus-install/lib/pkgconfig:${PKG_CONFIG_PATH}
+export LD_LIBRARY_PATH=${ROOT_DIR}/../opus-install/lib:${LD_LIBRARY_PATH}
 ```
 
 `sender` / `receiver` 会通过 `internal/opusx` 直接调用本地 `libopus`，并支持：
@@ -43,7 +44,7 @@ cd webrtc_demo
 go run ./receiver \
   --signal http://127.0.0.1:8090 \
   --session demo-session \
-  --weights /workspace/weights_blob.bin \
+  --weights ${PWD}/../weights_blob.bin \
   --output /tmp/received.wav \
   --duration 8s \
   --sim-loss 0.10 \
@@ -58,7 +59,7 @@ go run ./sender \
   --signal http://127.0.0.1:8090 \
   --session demo-session \
   --input /path/to/input_48k_mono.wav \
-  --weights /workspace/weights_blob.bin \
+  --weights ${PWD}/../weights_blob.bin \
   --dred 3 --plp 15 --fec=true
 ```
 
@@ -92,6 +93,12 @@ bash scripts/run_rtc_experiments.sh
 - `lbrr_dred`
 
 并输出一份对比 CSV，便于本地 Opus 改动后的快速回归。
+
+默认实验会自动联网下载三类代表性音频并统一转码到 48k 单声道：
+
+- `music`：音乐片段（SoundHelix）
+- `news`：新闻播报片段（BBC podcast RSS 自动解析）
+- `dialogue`：多人对话场景片段（餐厅会话环境音）
 
 ### 当前实现说明
 
