@@ -3,7 +3,16 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
-SIGNAL_PORT="${SIGNAL_PORT:-18090}"
+if [[ -z "${SIGNAL_PORT:-}" ]]; then
+  SIGNAL_PORT="$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+fi
 SIGNAL_URL="http://127.0.0.1:${SIGNAL_PORT}"
 SESSION_ID="session-$(date +%s)"
 INPUT_WAV="${TMP_DIR}/tone_48k_mono.wav"
