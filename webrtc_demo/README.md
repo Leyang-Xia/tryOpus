@@ -1,35 +1,31 @@
-# Pion WebRTC 轻量 Demo
-
-本目录现在包含两个层次的 WebRTC Demo：
-
-1. **DataChannel 浏览器演示**（原有）
-2. **方案 B：Pion 音频 P2P 轻量实现**（新增）
-
----
-
-## 1) DataChannel 浏览器演示
-
-```bash
-cd webrtc_demo
-go run .
-```
-
-浏览器打开 `http://127.0.0.1:8080`，点击“连接”后可发送消息并看到回显。
-
----
-
-## 2) 方案 B：Pion 音频 P2P 轻量实现
+# Pion WebRTC 方案 B：音频 P2P 轻量实现
 
 对应 `docs/端到端落地方案.md` 的 **方案 B**，目录如下：
 
 ```
 webrtc_demo/
+├── internal/opusx/       # 本地 libopus(含DRED) cgo 封装
 ├── signaling/            # HTTP 信令服务
 ├── sender/               # WAV -> Opus -> WebRTC 发送
 ├── receiver/             # WebRTC 接收 -> Opus 解码 -> WAV
 ├── scripts/run_test.sh   # 一键端到端测试
+├── scripts/run_rtc_experiments.sh # RTC传输模拟实验矩阵
 └── scripts/gen_tone.py   # 生成 48k 单声道测试音频
 ```
+
+## 依赖准备（本地 Opus + DRED）
+
+```bash
+export PKG_CONFIG_PATH=/workspace/opus-install/lib/pkgconfig:${PKG_CONFIG_PATH}
+export LD_LIBRARY_PATH=/workspace/opus-install/lib:${LD_LIBRARY_PATH}
+```
+
+`sender` / `receiver` 会通过 `internal/opusx` 直接调用本地 `libopus`，并支持：
+
+- `OPUS_SET_DRED_DURATION`
+- `OPUS_SET_DNN_BLOB`
+- `opus_dred_parse`
+- `opus_decoder_dred_decode`
 
 ### 手动运行
 
@@ -47,8 +43,11 @@ cd webrtc_demo
 go run ./receiver \
   --signal http://127.0.0.1:8090 \
   --session demo-session \
+  --weights /workspace/weights_blob.bin \
   --output /tmp/received.wav \
-  --duration 8s
+  --duration 8s \
+  --sim-loss 0.10 \
+  --use-dred=true
 ```
 
 终端 3：启动发送端
@@ -58,7 +57,9 @@ cd webrtc_demo
 go run ./sender \
   --signal http://127.0.0.1:8090 \
   --session demo-session \
-  --input /path/to/input_48k_mono.wav
+  --input /path/to/input_48k_mono.wav \
+  --weights /workspace/weights_blob.bin \
+  --dred 3 --plp 15 --fec=true
 ```
 
 ### 一键端到端测试
@@ -73,22 +74,29 @@ bash scripts/run_test.sh
 - 启动信令服务
 - 生成测试音频
 - 启动 receiver/sender 建链并传输
-- 校验输出 WAV 是否生成
+- 启用模拟丢包并验证 DRED/LBRR/PLC 恢复路径
+- 校验输出 WAV 和统计 JSON
 
-### 当前实现说明
-
-- 发送端使用 `github.com/hraban/opus` 进行 Opus 编码，支持 FEC/PLP 配置。
-- 接收端进行 Opus 解码并输出 WAV，同时打印接收统计。
-- 网络损伤（`tc netem`）需要在宿主机上单独注入。
-- **DRED API 仍需自定义 libopus 绑定支持**，本版先完成方案 B 的 WebRTC 音频链路最小落地。
-
----
-
-## 自动化测试
+### RTC 传输模拟实验（快速回归）
 
 ```bash
 cd webrtc_demo
-go test -v .
+bash scripts/run_rtc_experiments.sh
 ```
 
-该测试用于校验浏览器 DataChannel 示例的 Offer/Answer 与回显逻辑。
+默认会在同一套输入音频和丢包条件下跑四组实验：
+
+- `baseline_no_protection`
+- `lbrr_only`
+- `dred_only`
+- `lbrr_dred`
+
+并输出一份对比 CSV，便于本地 Opus 改动后的快速回归。
+
+### 当前实现说明
+
+- 音频链路固定为 48kHz，发送端将单声道扩展为 Opus 双声道，接收端下混为单声道 WAV。
+- 接收端支持两类“传输损伤”来源：
+  - RTP 序号缺口推断（真实网络丢包）
+  - 内置仿真（均匀丢包 / Gilbert-Elliott / 延迟抖动）
+- 当前实验重点是快速验证 Opus 编码与恢复策略，不包含 STT/LLM/TTS 业务层。

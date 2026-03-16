@@ -3,12 +3,13 @@ package main
 import (
 	"flag"
 	"log"
+	"path/filepath"
 	"time"
 
-	"github.com/hraban/opus"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
+	"opus_lab/webrtc_demo/internal/opusx"
 	"opus_lab/webrtc_demo/internal/rtc"
 	"opus_lab/webrtc_demo/internal/signal"
 	"opus_lab/webrtc_demo/internal/wav"
@@ -16,15 +17,19 @@ import (
 
 func main() {
 	var (
-		signalURL   string
-		sessionID   string
-		inputWAV    string
-		frameMS     int
-		bitrate     int
-		packetLoss  int
-		enableFEC   bool
-		connectWait time.Duration
-		signalWait  time.Duration
+		signalURL    string
+		sessionID    string
+		inputWAV     string
+		frameMS      int
+		bitrate      int
+		packetLoss   int
+		enableFEC    bool
+		enableVBR    bool
+		complexity   int
+		dredDuration int
+		dnnBlobPath  string
+		connectWait  time.Duration
+		signalWait   time.Duration
 	)
 
 	flag.StringVar(&signalURL, "signal", "http://127.0.0.1:8090", "signaling server base URL")
@@ -34,6 +39,10 @@ func main() {
 	flag.IntVar(&bitrate, "bitrate", 32000, "opus bitrate in bps")
 	flag.IntVar(&packetLoss, "plp", 10, "expected packet loss percentage for opus encoder")
 	flag.BoolVar(&enableFEC, "fec", true, "enable opus in-band FEC")
+	flag.BoolVar(&enableVBR, "vbr", true, "enable opus VBR")
+	flag.IntVar(&complexity, "complexity", 9, "opus complexity (0-10)")
+	flag.IntVar(&dredDuration, "dred", 0, "opus dred duration in 10ms units, 0 to disable")
+	flag.StringVar(&dnnBlobPath, "weights", "../weights_blob.bin", "path to DNN blob file for DRED")
 	flag.DurationVar(&connectWait, "connect-timeout", 10*time.Second, "peer connection timeout")
 	flag.DurationVar(&signalWait, "signal-timeout", 20*time.Second, "answer wait timeout")
 	flag.Parse()
@@ -47,6 +56,14 @@ func main() {
 	if frameMS <= 0 {
 		log.Fatal("--frame-ms must be > 0")
 	}
+	if dredDuration > 0 && packetLoss == 0 {
+		packetLoss = 10
+	}
+	if dnnBlobPath != "" {
+		if absPath, err := filepath.Abs(dnnBlobPath); err == nil {
+			dnnBlobPath = absPath
+		}
+	}
 
 	audio, err := wav.ReadPCM16Mono(inputWAV)
 	if err != nil {
@@ -55,6 +72,7 @@ func main() {
 	if audio.SampleRate != 48000 {
 		log.Fatalf("unsupported sample rate=%d, sender currently requires 48000Hz", audio.SampleRate)
 	}
+	log.Printf("sender using opus: %s", opusx.Version())
 
 	client := signal.NewClient(signalURL)
 	if _, err := client.CreateSession(sessionID); err != nil {
@@ -143,18 +161,39 @@ func main() {
 		log.Fatalf("peer connect timeout after %s", connectWait)
 	}
 
-	encoder, err := opus.NewEncoder(48000, 2, opus.AppVoIP)
+	encoder, err := opusx.NewEncoder(48000, 2, opusx.AppVoIP)
 	if err != nil {
 		log.Fatalf("create opus encoder failed: %v", err)
 	}
+	defer encoder.Close()
+
 	if err := encoder.SetBitrate(bitrate); err != nil {
 		log.Fatalf("set encoder bitrate failed: %v", err)
+	}
+	if err := encoder.SetComplexity(complexity); err != nil {
+		log.Fatalf("set encoder complexity failed: %v", err)
 	}
 	if err := encoder.SetInBandFEC(enableFEC); err != nil {
 		log.Fatalf("set in-band fec failed: %v", err)
 	}
+	if err := encoder.SetVBR(enableVBR); err != nil {
+		log.Fatalf("set vbr failed: %v", err)
+	}
 	if err := encoder.SetPacketLossPerc(packetLoss); err != nil {
 		log.Fatalf("set packet loss percentage failed: %v", err)
+	}
+	if dredDuration > 0 {
+		if err := encoder.SetDREDDuration(dredDuration); err != nil {
+			log.Fatalf("set dred duration failed: %v", err)
+		}
+		blob, err := opusx.LoadDNNBlob(dnnBlobPath)
+		if err != nil {
+			log.Fatalf("load dnn blob failed: %v", err)
+		}
+		if err := encoder.SetDNNBlob(blob); err != nil {
+			log.Fatalf("set encoder dnn blob failed: %v", err)
+		}
+		log.Printf("sender DRED enabled: duration=%d, blob=%s", dredDuration, dnnBlobPath)
 	}
 
 	samplesPerFrame := 48000 * frameMS / 1000
@@ -180,7 +219,7 @@ func main() {
 			stereoPCM[j*2+1] = sample
 		}
 
-		n, encodeErr := encoder.Encode(stereoPCM, packetBuf)
+		n, encodeErr := encoder.Encode(stereoPCM, samplesPerFrame, packetBuf)
 		if encodeErr != nil {
 			log.Fatalf("encode opus frame=%d failed: %v", i, encodeErr)
 		}

@@ -274,21 +274,26 @@ python3 tools/analyze.py --compare results/
 
 ## Pion WebRTC 轻量 Demo
 
-仓库新增了独立的 `webrtc_demo/` 子目录，用于快速验证 Pion WebRTC 的最小链路（浏览器 ↔ Go 服务端）：
+仓库新增了独立的 `webrtc_demo/` 子目录，用于实现并验证 `docs/端到端落地方案.md` 的**方案 B（Pion 音频 P2P 轻量实现）**：
 
-- 使用 HTTP `/offer` 完成 SDP 交换
-- 使用 DataChannel 进行双向通信和服务端回显
-- 不依赖当前 C/CMake 主工程，可单独运行
+- `signaling`：轻量 HTTP 信令服务
+- `sender`：WAV → 本地 Opus（支持 FEC/DRED）→ WebRTC 音频发送
+- `receiver`：WebRTC 接收 → 本地 Opus（支持 DRED 恢复）→ WAV 输出 + 统计
+- 支持 RTC 传输仿真（均匀丢包/GE/延迟抖动）用于快速回归
 
 快速体验：
 
 ```bash
 cd webrtc_demo
-go mod tidy
-go run .
+bash scripts/run_test.sh
 ```
 
-浏览器打开 `http://127.0.0.1:8080`，点击“连接”后即可发送消息并看到回显。
+快速实验矩阵：
+
+```bash
+cd webrtc_demo
+bash scripts/run_rtc_experiments.sh
+```
 
 如果在 Cursor Cloud 中运行，建议在启动脚本执行：
 
