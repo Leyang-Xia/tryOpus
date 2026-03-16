@@ -19,23 +19,73 @@ func ReadPCM16Mono(path string) (PCM16Mono, error) {
 	}
 	defer f.Close()
 
-	header := make([]byte, 44)
-	if _, err := io.ReadFull(f, header); err != nil {
-		return PCM16Mono{}, fmt.Errorf("read wav header failed: %w", err)
+	fileHeader := make([]byte, 12)
+	if _, err := io.ReadFull(f, fileHeader); err != nil {
+		return PCM16Mono{}, fmt.Errorf("read wav file header failed: %w", err)
 	}
-
-	if string(header[0:4]) != "RIFF" || string(header[8:12]) != "WAVE" {
+	if string(fileHeader[0:4]) != "RIFF" || string(fileHeader[8:12]) != "WAVE" {
 		return PCM16Mono{}, fmt.Errorf("invalid wav magic")
 	}
-	if string(header[12:16]) != "fmt " || string(header[36:40]) != "data" {
-		return PCM16Mono{}, fmt.Errorf("unsupported wav layout: only canonical 44-byte pcm header is supported")
+
+	var (
+		audioFormat   uint16
+		numChannels   uint16
+		sampleRate    uint32
+		bitsPerSample uint16
+		dataBytes     []byte
+		gotFmt        bool
+		gotData       bool
+	)
+
+	for {
+		chunkHeader := make([]byte, 8)
+		_, err := io.ReadFull(f, chunkHeader)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return PCM16Mono{}, fmt.Errorf("read wav chunk header failed: %w", err)
+		}
+
+		chunkID := string(chunkHeader[0:4])
+		chunkSize := binary.LittleEndian.Uint32(chunkHeader[4:8])
+		if chunkSize > 512*1024*1024 {
+			return PCM16Mono{}, fmt.Errorf("wav chunk too large: %d", chunkSize)
+		}
+
+		chunkData := make([]byte, chunkSize)
+		if _, err := io.ReadFull(f, chunkData); err != nil {
+			return PCM16Mono{}, fmt.Errorf("read wav chunk data(%s) failed: %w", chunkID, err)
+		}
+		// RIFF chunks are word-aligned.
+		if chunkSize%2 == 1 {
+			if _, err := f.Seek(1, io.SeekCurrent); err != nil {
+				return PCM16Mono{}, fmt.Errorf("seek wav pad byte failed: %w", err)
+			}
+		}
+
+		switch chunkID {
+		case "fmt ":
+			if len(chunkData) < 16 {
+				return PCM16Mono{}, fmt.Errorf("invalid fmt chunk size=%d", len(chunkData))
+			}
+			audioFormat = binary.LittleEndian.Uint16(chunkData[0:2])
+			numChannels = binary.LittleEndian.Uint16(chunkData[2:4])
+			sampleRate = binary.LittleEndian.Uint32(chunkData[4:8])
+			bitsPerSample = binary.LittleEndian.Uint16(chunkData[14:16])
+			gotFmt = true
+		case "data":
+			dataBytes = chunkData
+			gotData = true
+		}
+		if gotFmt && gotData {
+			break
+		}
 	}
 
-	audioFormat := binary.LittleEndian.Uint16(header[20:22])
-	numChannels := binary.LittleEndian.Uint16(header[22:24])
-	sampleRate := binary.LittleEndian.Uint32(header[24:28])
-	bitsPerSample := binary.LittleEndian.Uint16(header[34:36])
-	dataSize := binary.LittleEndian.Uint32(header[40:44])
+	if !gotFmt || !gotData {
+		return PCM16Mono{}, fmt.Errorf("wav missing required fmt/data chunks")
+	}
 
 	if audioFormat != 1 {
 		return PCM16Mono{}, fmt.Errorf("unsupported wav format=%d, only PCM is supported", audioFormat)
@@ -46,18 +96,13 @@ func ReadPCM16Mono(path string) (PCM16Mono, error) {
 	if bitsPerSample != 16 {
 		return PCM16Mono{}, fmt.Errorf("unsupported bits_per_sample=%d, only 16-bit is supported", bitsPerSample)
 	}
-	if dataSize%2 != 0 {
-		return PCM16Mono{}, fmt.Errorf("invalid data chunk size=%d", dataSize)
+	if len(dataBytes)%2 != 0 {
+		return PCM16Mono{}, fmt.Errorf("invalid data chunk size=%d", len(dataBytes))
 	}
 
-	raw := make([]byte, dataSize)
-	if _, err := io.ReadFull(f, raw); err != nil {
-		return PCM16Mono{}, fmt.Errorf("read wav samples failed: %w", err)
-	}
-
-	samples := make([]int16, len(raw)/2)
+	samples := make([]int16, len(dataBytes)/2)
 	for i := 0; i < len(samples); i++ {
-		samples[i] = int16(binary.LittleEndian.Uint16(raw[i*2 : i*2+2]))
+		samples[i] = int16(binary.LittleEndian.Uint16(dataBytes[i*2 : i*2+2]))
 	}
 	return PCM16Mono{
 		SampleRate: int(sampleRate),
