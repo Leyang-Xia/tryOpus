@@ -191,7 +191,7 @@ func main() {
 			log.Fatalf("load dnn blob failed: %v", err)
 		}
 		if err := encoder.SetDNNBlob(blob); err != nil {
-			log.Fatalf("set encoder dnn blob failed: %v", err)
+			log.Printf("warning: set encoder dnn blob failed (%v), continue", err)
 		}
 		log.Printf("sender DRED enabled: duration=%d, blob=%s", dredDuration, dnnBlobPath)
 	}
