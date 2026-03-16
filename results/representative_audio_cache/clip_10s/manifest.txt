@@ -1,0 +1,3 @@
+music|/Users/leyang/Projects/tryOpus/results/representative_audio_cache/clip_10s/wav/music_48k_mono.wav
+news|/Users/leyang/Projects/tryOpus/results/representative_audio_cache/clip_10s/wav/news_48k_mono.wav
+dialogue|/Users/leyang/Projects/tryOpus/results/representative_audio_cache/clip_10s/wav/dialogue_48k_mono.wav

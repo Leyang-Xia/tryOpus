@@ -10,20 +10,24 @@ set -euo pipefail
 #   保护策略  : baseline(无保护), LBRR, DRED-3, DRED-5, LBRR+DRED-3
 #
 # 输出:
-#   - 汇总 CSV            → $SUMMARY_CSV (默认 /tmp 下)
-#   - Markdown 报告       → $REPORT_MD  (默认 results/rtc_report.md)
+#   - 汇总 CSV            → $SUMMARY_CSV
+#   - Markdown 报告       → $REPORT_MD
+#   - 输入/输出音频       → $RUN_DIR/inputs, $RUN_DIR/outputs
+#   - 统计 JSON / 日志     → $RUN_DIR/stats, $RUN_DIR/logs
 #
 # 环境变量:
 #   EXPERIMENT_SUITE  quick|standard|full (默认 standard)
-#   RECV_DURATION     接收时长 (默认 6s)
-#   CLIP_SECONDS      音频剪辑时长 (默认 4)
+#   RECV_DURATION     接收时长 (默认 CLIP_SECONDS + 2s)
+#   CLIP_SECONDS      音频剪辑时长 (默认 10)
 #   SIM_SEED          随机种子 (默认 42)
+#   RUN_ID            实验目录名 (默认时间戳)
+#   RUN_DIR           实验产物目录 (默认 results/rtc_runs/$RUN_ID)
+#   REP_AUDIO_CACHE_DIR 代表性音频缓存根目录
 #   REPORT_MD         报告输出路径
 # ==========================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKSPACE_DIR="$(cd "${ROOT_DIR}/.." && pwd)"
-TMP_DIR="$(mktemp -d)"
 
 if [[ -z "${SIGNAL_PORT:-}" ]]; then
   SIGNAL_PORT="$(python3 - <<'PY'
@@ -40,12 +44,26 @@ SIGNAL_URL="http://127.0.0.1:${SIGNAL_PORT}"
 OPUS_PKG_CONFIG="${OPUS_PKG_CONFIG:-${WORKSPACE_DIR}/opus-install/lib/pkgconfig}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${WORKSPACE_DIR}/weights_blob.bin}"
 SIM_SEED="${SIM_SEED:-42}"
-RECV_DURATION="${RECV_DURATION:-6s}"
-CLIP_SECONDS="${CLIP_SECONDS:-4}"
-AUDIO_MANIFEST="${AUDIO_MANIFEST:-${TMP_DIR}/audio_manifest.txt}"
-SUMMARY_CSV="${SUMMARY_CSV:-${TMP_DIR}/rtc_experiment_summary.csv}"
-REPORT_MD="${REPORT_MD:-${WORKSPACE_DIR}/results/rtc_report.md}"
+DEFAULT_RECV_DURATION="$((CLIP_SECONDS + 2))s"
+RECV_DURATION="${RECV_DURATION:-${DEFAULT_RECV_DURATION}}"
+CLIP_SECONDS="${CLIP_SECONDS:-10}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+RUN_DIR="${RUN_DIR:-${WORKSPACE_DIR}/results/rtc_runs/${RUN_ID}}"
+REP_AUDIO_CACHE_DIR="${REP_AUDIO_CACHE_DIR:-${WORKSPACE_DIR}/results/representative_audio_cache}"
+CACHE_DIR="${REP_AUDIO_CACHE_DIR}/clip_${CLIP_SECONDS}s"
+INPUT_DIR="${RUN_DIR}/inputs"
+OUTPUT_DIR="${RUN_DIR}/outputs"
+STATS_DIR="${RUN_DIR}/stats"
+LOG_DIR="${RUN_DIR}/logs"
+AUDIO_MANIFEST="${AUDIO_MANIFEST:-${RUN_DIR}/audio_manifest.txt}"
+SUMMARY_CSV="${SUMMARY_CSV:-${RUN_DIR}/rtc_experiment_summary.csv}"
+REPORT_MD="${REPORT_MD:-${RUN_DIR}/rtc_report.md}"
+LATEST_LINK="${WORKSPACE_DIR}/results/rtc_latest"
+LATEST_REPORT="${WORKSPACE_DIR}/results/rtc_report.md"
 EXPERIMENT_SUITE="${EXPERIMENT_SUITE:-standard}"
+
+mkdir -p "${RUN_DIR}" "${INPUT_DIR}" "${OUTPUT_DIR}" "${STATS_DIR}" "${LOG_DIR}" \
+         "$(dirname "${LATEST_LINK}")" "$(dirname "${LATEST_REPORT}")"
 
 export PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}:${PKG_CONFIG_PATH:-}"
 export LD_LIBRARY_PATH="${WORKSPACE_DIR}/opus-install/lib:${LD_LIBRARY_PATH:-}"
@@ -59,20 +77,30 @@ trap cleanup EXIT
 
 # ---- 准备代表性音频 ----
 echo "[exp] preparing representative audio (clip=${CLIP_SECONDS}s)"
+mkdir -p "${CACHE_DIR}"
 python3 "${WORKSPACE_DIR}/tools/prepare_representative_audio.py" \
-  --out-dir "${TMP_DIR}/audio" \
-  --manifest "${AUDIO_MANIFEST}" \
+  --out-dir "${CACHE_DIR}" \
+  --cache-dir "${CACHE_DIR}" \
+  --manifest "${CACHE_DIR}/manifest.txt" \
   --clip-seconds "${CLIP_SECONDS}"
 
+: > "${AUDIO_MANIFEST}"
+while IFS='|' read -r audio_type cached_wav; do
+  [[ -z "${audio_type}" ]] && continue
+  input_wav="${INPUT_DIR}/${audio_type}.wav"
+  cp "${cached_wav}" "${input_wav}"
+  echo "${audio_type}|${input_wav}" >> "${AUDIO_MANIFEST}"
+done < "${CACHE_DIR}/manifest.txt"
+
 # ---- CSV header ----
-echo "audio_type,scenario,case,sim_mode,sim_loss,recovered_lbrr,recovered_dred,plc,decode_errors,recovery_rate,input_wav,output_wav" \
+echo "audio_type,scenario,case,sim_mode,sim_loss,recovered_lbrr,recovered_dred,plc,decode_errors,recovery_rate,input_wav,output_wav,stats_json" \
   > "${SUMMARY_CSV}"
 
 # ---- 启动信令服务 ----
 echo "[exp] starting signaling server on ${SIGNAL_URL}"
 (
   cd "${ROOT_DIR}"
-  go run ./signaling -addr ":${SIGNAL_PORT}" >"${TMP_DIR}/signaling.log" 2>&1
+  go run ./signaling -addr ":${SIGNAL_PORT}" >"${LOG_DIR}/signaling.log" 2>&1
 ) &
 SIGNAL_PID=$!
 sleep 1
@@ -93,8 +121,10 @@ run_case() {
   local sender_extra="$8"
   local receiver_extra="$9"
   local session="session-${audio_type}-${scenario_name}-${case_name}-$(date +%s%N)"
-  local output_wav="${TMP_DIR}/${audio_type}_${scenario_name}_${case_name}.wav"
-  local stats_json="${TMP_DIR}/${audio_type}_${scenario_name}_${case_name}.json"
+  local output_wav="${OUTPUT_DIR}/${audio_type}/${scenario_name}/${case_name}.wav"
+  local stats_json="${STATS_DIR}/${audio_type}/${scenario_name}/${case_name}.json"
+
+  mkdir -p "$(dirname "${output_wav}")" "$(dirname "${stats_json}")"
 
   echo "[exp] audio=${audio_type} scenario=${scenario_name} case=${case_name}"
   (
@@ -108,7 +138,7 @@ run_case() {
       --weights "${WEIGHTS_PATH}" \
       --duration "${RECV_DURATION}" \
       ${sim_extra} \
-      ${receiver_extra} >"${TMP_DIR}/${audio_type}_${scenario_name}_${case_name}_receiver.log" 2>&1
+      ${receiver_extra} >"${LOG_DIR}/${audio_type}_${scenario_name}_${case_name}_receiver.log" 2>&1
   ) &
   local receiver_pid=$!
   sleep 1
@@ -120,7 +150,7 @@ run_case() {
       --session "${session}" \
       --input "${input_wav}" \
       --weights "${WEIGHTS_PATH}" ${sender_extra} \
-      >"${TMP_DIR}/${audio_type}_${scenario_name}_${case_name}_sender.log" 2>&1
+      >"${LOG_DIR}/${audio_type}_${scenario_name}_${case_name}_sender.log" 2>&1
   )
 
   wait "${receiver_pid}"
@@ -145,6 +175,7 @@ row = ",".join([
     str(s.get("decode_errors", 0)),
     f'{s.get("recovery_rate", 0.0):.4f}',
     input_wav, output_wav,
+    stats_path,
 ])
 with open(summary_csv, "a", encoding="utf-8") as out:
     out.write(row + "\n")
@@ -267,6 +298,9 @@ python3 "${WORKSPACE_DIR}/tools/gen_rtc_report.py" \
   --output "${REPORT_MD}" \
   --mode rtc
 
+cp "${REPORT_MD}" "${LATEST_REPORT}"
+ln -sfn "${RUN_DIR}" "${LATEST_LINK}"
+
 echo ""
 echo "========================================================"
 echo " 实验完成！"
@@ -274,5 +308,10 @@ echo "========================================================"
 echo " 总实验数    : ${count}"
 echo " 汇总 CSV    : ${SUMMARY_CSV}"
 echo " Markdown 报告: ${REPORT_MD}"
-echo " 临时目录    : ${TMP_DIR}"
+echo " 输入音频目录 : ${INPUT_DIR}"
+echo " 输出音频目录 : ${OUTPUT_DIR}"
+echo " 统计 JSON 目录: ${STATS_DIR}"
+echo " 日志目录    : ${LOG_DIR}"
+echo " 最新报告    : ${LATEST_REPORT}"
+echo " 最新运行链接 : ${LATEST_LINK}"
 echo "========================================================"

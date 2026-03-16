@@ -331,11 +331,22 @@ EXPERIMENT_SUITE=full bash scripts/run_rtc_experiments.sh
 - **恢复策略表**：各音频类型下各保护方案的 LBRR/DRED/PLC 恢复帧数与恢复率
 - **SNR/SegSNR 表**：全局信噪比与分段信噪比对比
 
+每次 RTC 实验还会保留完整输入/输出音频与统计工件，默认目录为 `results/rtc_runs/<RUN_ID>/`：
+- `inputs/`：本次使用的 `music/news/dialogue` 输入 WAV
+- `outputs/`：每个场景与保护策略对应的接收端输出 WAV
+- `stats/`：每个 case 的统计 JSON
+- `rtc_experiment_summary.csv` / `rtc_report.md`：本次实验汇总与报告
+
+为便于快速回归，代表性音频默认缓存到 `results/representative_audio_cache/clip_<N>s/`，重复执行时复用缓存；`results/rtc_latest` 始终指向最近一次 RTC 运行目录。
+默认新闻样本使用稳定的小体积 fallback 片段；如需强制改回 BBC live RSS 源，可设置 `REP_AUDIO_PREFER_LIVE_NEWS=1`。
+
 默认实验会自动联网下载三类代表性音频并统一转码到 48kHz 单声道：
 
 - `music`：音乐片段（SoundHelix）
 - `news`：新闻播报片段（BBC podcast RSS 自动解析）
 - `dialogue`：多人对话场景片段（餐厅会话环境音）
+
+默认每类截取 10 秒音频；如需覆盖，可设置环境变量 `CLIP_SECONDS`。
 
 如果在 Cursor Cloud 中运行，建议在启动脚本执行：
 

@@ -13,11 +13,12 @@ prepare_representative_audio.py - 下载三类代表性音频并转码为 48kHz 
 """
 
 import argparse
+import os
 import pathlib
 import re
+import shutil
 import subprocess
 import urllib.request
-import urllib.parse
 from dataclasses import dataclass
 
 
@@ -28,24 +29,21 @@ class AudioSpec:
     clip_seconds: int
 
 
-def _download(url: str, target: pathlib.Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    urllib.request.urlretrieve(url, str(target))
-
-
-def _convert_to_wav(src: pathlib.Path, dst: pathlib.Path, clip_seconds: int) -> None:
+def _extract_clip_to_wav(src: str, dst: pathlib.Path, clip_seconds: int) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(src),
-        "-ac", "1", "-ar", "48000",
         "-t", str(clip_seconds),
+        "-i", src,
+        "-ac", "1", "-ar", "48000",
         str(dst),
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=max(60, clip_seconds * 10))
 
 
 def _resolve_news_url(default_url: str) -> str:
+    if os.environ.get("REP_AUDIO_PREFER_LIVE_NEWS", "").lower() not in {"1", "true", "yes"}:
+        return default_url
     rss_url = "https://podcasts.files.bbci.co.uk/p02nq0gn.rss"
     try:
         with urllib.request.urlopen(rss_url, timeout=15) as resp:
@@ -65,13 +63,17 @@ def main() -> None:
                         help="Directory for output wav files")
     parser.add_argument("--manifest", required=True,
                         help="Manifest output path, each line: audio_type|wav_path")
-    parser.add_argument("--clip-seconds", type=int, default=4,
+    parser.add_argument("--cache-dir",
+                        help="Optional persistent cache dir for normalized wav files; defaults to --out-dir")
+    parser.add_argument("--clip-seconds", type=int, default=10,
                         help="Clip length in seconds for each sample")
+    parser.add_argument("--force", action="store_true",
+                        help="Redownload and reconvert even if cached files already exist")
     args = parser.parse_args()
 
     out_dir = pathlib.Path(args.out_dir).resolve()
-    raw_dir = out_dir / "raw"
-    wav_dir = out_dir / "wav"
+    cache_dir = pathlib.Path(args.cache_dir).resolve() if args.cache_dir else out_dir
+    wav_dir = cache_dir / "wav"
     manifest_path = pathlib.Path(args.manifest).resolve()
 
     news_fallback = "https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/mlk.flac"
@@ -97,14 +99,30 @@ def main() -> None:
     lines = []
 
     for spec in specs:
-        suffix = pathlib.Path(urllib.parse.urlparse(spec.source_url).path).suffix or ".bin"
-        raw_path = raw_dir / f"{spec.audio_type}{suffix}"
         wav_path = wav_dir / f"{spec.audio_type}_48k_mono.wav"
-        print(f"[audio] downloading {spec.audio_type} from {spec.source_url}")
-        _download(spec.source_url, raw_path)
-        print(f"[audio] converting {spec.audio_type} -> {wav_path}")
-        _convert_to_wav(raw_path, wav_path, spec.clip_seconds)
-        lines.append(f"{spec.audio_type}|{wav_path}")
+        out_wav_path = out_dir / "wav" / f"{spec.audio_type}_48k_mono.wav"
+
+        if args.force or not wav_path.exists():
+            print(f"[audio] extracting {spec.clip_seconds}s clip for {spec.audio_type} from {spec.source_url}")
+            _extract_clip_to_wav(spec.source_url, wav_path, spec.clip_seconds)
+        else:
+            print(f"[audio] reuse cached wav {spec.audio_type}: {wav_path}")
+
+        out_wav_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_wav_path != wav_path:
+            if args.force or not out_wav_path.exists():
+                print(f"[audio] copying {spec.audio_type} wav -> {out_wav_path}")
+                shutil.copy2(wav_path, out_wav_path)
+            else:
+                src_mtime = wav_path.stat().st_mtime
+                dst_mtime = out_wav_path.stat().st_mtime
+                if src_mtime > dst_mtime or os.path.getsize(out_wav_path) != os.path.getsize(wav_path):
+                    print(f"[audio] refreshing copied wav {spec.audio_type} -> {out_wav_path}")
+                    shutil.copy2(wav_path, out_wav_path)
+        else:
+            out_wav_path = wav_path
+
+        lines.append(f"{spec.audio_type}|{out_wav_path}")
 
     manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"[audio] manifest={manifest_path}")

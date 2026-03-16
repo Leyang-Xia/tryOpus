@@ -8,7 +8,7 @@ gen_rtc_report.py - 从实验汇总 CSV 生成 Markdown 报告
 CSV 列（RTC）:
   audio_type,scenario,case,sim_mode,sim_loss,
   recovered_lbrr,recovered_dred,plc,decode_errors,recovery_rate,
-  input_wav,output_wav
+  input_wav,output_wav,stats_json
 
 CSV 列（离线仿真）:
   audio_type,experiment,name,loss_model,loss_param,
@@ -145,6 +145,16 @@ def _try_snr(input_wav: str, output_wav: str) -> Tuple[Optional[float], Optional
         return None, None
 
 
+def _artifact_link(report_path: str, artifact_path: str) -> str:
+    if not artifact_path:
+        return "-"
+    if not os.path.isfile(artifact_path):
+        return artifact_path
+    report_dir = os.path.dirname(os.path.abspath(report_path)) or "."
+    rel_path = os.path.relpath(os.path.abspath(artifact_path), report_dir)
+    return f"[{os.path.basename(artifact_path)}]({rel_path})"
+
+
 def generate_rtc_report(csv_path: str, output_path: str) -> None:
     rows: list = []
     with open(csv_path, "r", encoding="utf-8") as f:
@@ -240,6 +250,22 @@ def generate_rtc_report(csv_path: str, output_path: str) -> None:
         snr = r.get("snr", "-")
         segsnr = r.get("segsnr", "-")
         lines.append(f"| {at_label} | {s_label} | {c_label} | {snr} | {segsnr} |")
+    lines.append("")
+
+    lines.append("## 音频工件对照\n")
+    lines.append("| 音频类型 | 丢包场景 | 保护策略 | 输入音频 | 输出音频 | 统计 JSON |")
+    lines.append("|---------|---------|---------|---------|---------|---------|")
+    for r in rows:
+        at = r.get("audio_type", "")
+        scenario = r.get("scenario", r.get("experiment", ""))
+        case = r.get("case", r.get("name", ""))
+        at_label = AUDIO_LABELS.get(at, at)
+        s_label = SCENARIO_LABELS.get(scenario, scenario)
+        c_label = CASE_LABELS.get(case, case)
+        input_ref = _artifact_link(output_path, r.get("input_wav", ""))
+        output_ref = _artifact_link(output_path, r.get("output_wav", ""))
+        stats_ref = _artifact_link(output_path, r.get("stats_json", ""))
+        lines.append(f"| {at_label} | {s_label} | {c_label} | {input_ref} | {output_ref} | {stats_ref} |")
     lines.append("")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
