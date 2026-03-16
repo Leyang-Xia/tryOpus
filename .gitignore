@@ -6,6 +6,8 @@ build/
 # 音频输出（测试结果）
 results/*.wav
 results/*.csv
+results/*.log
+results/audio_cache/
 audio/*.wav
 
 # IDE

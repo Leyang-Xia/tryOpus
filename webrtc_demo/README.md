@@ -8,9 +8,11 @@ webrtc_demo/
 ├── signaling/            # HTTP 信令服务
 ├── sender/               # WAV -> Opus -> WebRTC 发送
 ├── receiver/             # WebRTC 接收 -> Opus 解码 -> WAV
-├── scripts/run_test.sh   # 一键端到端测试
-├── scripts/run_rtc_experiments.sh # RTC传输模拟实验矩阵
-└── scripts/gen_tone.py   # 生成 48k 单声道测试音频
+├── scripts/
+│   ├── run_test.sh                     # 一键端到端测试
+│   ├── run_rtc_experiments.sh          # RTC 传输模拟实验矩阵（含报告生成）
+│   ├── gen_tone.py                     # 生成 48k 单声道测试音频
+│   └── prepare_representative_audio.py # 代表性音频下载（委托 tools/ 版本）
 ```
 
 ## 依赖准备（本地 Opus + DRED）
@@ -78,27 +80,61 @@ bash scripts/run_test.sh
 - 启用模拟丢包并验证 DRED/LBRR/PLC 恢复路径
 - 校验输出 WAV 和统计 JSON
 
-### RTC 传输模拟实验（快速回归）
+### RTC 传输模拟实验矩阵
 
 ```bash
 cd webrtc_demo
+
+# 标准实验矩阵（默认）
 bash scripts/run_rtc_experiments.sh
+
+# 快速回归
+EXPERIMENT_SUITE=quick bash scripts/run_rtc_experiments.sh
+
+# 完整矩阵（含延迟抖动场景）
+EXPERIMENT_SUITE=full bash scripts/run_rtc_experiments.sh
 ```
 
-默认会在同一套输入音频和丢包条件下跑四组实验：
+#### 实验矩阵
 
-- `baseline_no_protection`
-- `lbrr_only`
-- `dred_only`
-- `lbrr_dred`
+**丢包场景（standard 模式）：**
 
-并输出一份对比 CSV，便于本地 Opus 改动后的快速回归。
+| 标识 | 说明 |
+|------|------|
+| `uniform_5` | 均匀 5% 丢包 |
+| `uniform_10` | 均匀 10% 丢包 |
+| `uniform_20` | 均匀 20% 丢包 |
+| `ge_moderate` | GE 中等突发 (p2b=0.05, b2g=0.30, bloss=0.80, 期望≈11%) |
+| `ge_heavy` | GE 重度突发 (p2b=0.10, b2g=0.15, bloss=0.90, 期望≈25%) |
 
-默认实验会自动联网下载三类代表性音频并统一转码到 48k 单声道：
+full 模式额外增加 `delay_jitter_10`（均匀 10% + 50ms 延迟 + 20ms 抖动）。
+
+**保护策略：**
+
+| 标识 | 说明 |
+|------|------|
+| `baseline` | 无保护 (仅 PLC) |
+| `lbrr_only` | LBRR 带内 FEC |
+| `dred_3` | DRED 3 帧冗余 |
+| `dred_5` | DRED 5 帧冗余（standard/full 模式） |
+| `lbrr_dred_3` | LBRR + DRED-3 组合 (VBR 64kbps) |
+
+#### 代表性音频
+
+实验会自动联网下载三类代表性音频并统一转码到 48kHz 单声道：
 
 - `music`：音乐片段（SoundHelix）
 - `news`：新闻播报片段（BBC podcast RSS 自动解析）
 - `dialogue`：多人对话场景片段（餐厅会话环境音）
+
+#### 实验报告
+
+实验完成后自动生成 `results/rtc_report.md`，包含：
+
+- **恢复策略对比表**：按音频类型分组，展示各保护方案的 LBRR/DRED/PLC 恢复帧数与恢复率
+- **音质指标表 (SNR/SegSNR)**：对比各方案的全局信噪比与分段信噪比
+
+输出路径可通过 `REPORT_MD` 环境变量自定义。
 
 ### 当前实现说明
 

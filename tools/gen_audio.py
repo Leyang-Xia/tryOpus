@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-gen_audio.py - 生成测试音频WAV文件
+gen_audio.py - 生成合成测试音频 WAV 文件
 
-支持以下类型:
+支持以下合成类型:
   sine      - 纯正弦波（默认440Hz）
   speech    - 模拟语音信号（多正弦叠加 + 幅度包络）
   chirp     - 线性调频信号
@@ -10,9 +10,13 @@ gen_audio.py - 生成测试音频WAV文件
   mixed     - 混合信号（语音+噪声）
 
 用法:
-  python3 gen_audio.py                    # 生成所有测试文件
+  python3 gen_audio.py                    # 生成所有合成测试文件
   python3 gen_audio.py --type speech --out my_speech.wav
   python3 gen_audio.py --type sine --freq 1000 --duration 5
+
+如果需要代表性真实音频（music / news / dialogue），请使用:
+  python3 tools/prepare_representative_audio.py \\
+      --out-dir audio --manifest audio/manifest.txt --clip-seconds 10
 """
 
 import struct
