@@ -215,9 +215,6 @@ func (d *Decoder) SetDNNBlob(blob []byte) error {
 }
 
 func (d *Decoder) EnableDRED(blob []byte) error {
-	if len(blob) == 0 {
-		return fmt.Errorf("empty dnn blob")
-	}
 	var errCode C.int
 	d.dredDec = C.opus_dred_decoder_create(&errCode)
 	if err := opusError(errCode); err != nil {
@@ -233,11 +230,14 @@ func (d *Decoder) EnableDRED(blob []byte) error {
 	if d.dredState == nil {
 		return fmt.Errorf("opus_dred_alloc returned nil")
 	}
-	return opusError(C.go_opus_dred_decoder_set_dnn_blob(
-		d.dredDec,
-		unsafe.Pointer(&blob[0]),
-		C.int(len(blob)),
-	))
+	if len(blob) > 0 {
+		return opusError(C.go_opus_dred_decoder_set_dnn_blob(
+			d.dredDec,
+			unsafe.Pointer(&blob[0]),
+			C.int(len(blob)),
+		))
+	}
+	return nil
 }
 
 func (d *Decoder) Decode(packet []byte, frameSize int, decodeFEC bool, pcm []int16) (int, error) {

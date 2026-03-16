@@ -192,14 +192,12 @@ func main() {
 		if useDRED {
 			blob, decErr = opusx.LoadDNNBlob(dnnBlobPath)
 			if decErr != nil {
-				log.Printf("load dnn blob failed, disable DRED: %v", decErr)
-				useDRED = false
+				log.Printf("warning: load dnn blob failed (%v), continue without external blob", decErr)
 			}
 		}
 		if len(blob) > 0 {
 			if err := decoder.SetDNNBlob(blob); err != nil {
-				log.Printf("set decoder dnn blob failed, disable DRED: %v", err)
-				useDRED = false
+				log.Printf("warning: set decoder dnn blob failed (%v), continue", err)
 			}
 		}
 		if useDRED {
