@@ -122,11 +122,15 @@ func (e *Encoder) SetDNNBlob(blob []byte) error {
 	if len(blob) == 0 {
 		return fmt.Errorf("empty dnn blob")
 	}
-	return opusError(C.go_opus_encoder_set_dnn_blob(
+	ret := C.go_opus_encoder_set_dnn_blob(
 		e.st,
 		unsafe.Pointer(&blob[0]),
 		C.int(len(blob)),
-	))
+	)
+	if ret == C.OPUS_UNIMPLEMENTED {
+		return nil
+	}
+	return opusError(ret)
 }
 
 func (e *Encoder) Encode(pcm []int16, frameSize int, packet []byte) (int, error) {
@@ -199,17 +203,37 @@ func (d *Decoder) SetDNNBlob(blob []byte) error {
 	if len(blob) == 0 {
 		return fmt.Errorf("empty dnn blob")
 	}
-	if err := opusError(C.go_opus_decoder_set_dnn_blob(
-		d.st, unsafe.Pointer(&blob[0]), C.int(len(blob)),
-	)); err != nil {
-		return err
-	}
-	if d.dredDec != nil {
-		if err := opusError(C.go_opus_dred_decoder_set_dnn_blob(
-			d.dredDec, unsafe.Pointer(&blob[0]), C.int(len(blob)),
-		)); err != nil {
+	ret := C.go_opus_decoder_set_dnn_blob(d.st, unsafe.Pointer(&blob[0]), C.int(len(blob)))
+	if ret != C.OPUS_UNIMPLEMENTED {
+		if err := opusError(ret); err != nil {
 			return err
 		}
+	}
+	if d.dredDec != nil {
+		ret = C.go_opus_dred_decoder_set_dnn_blob(d.dredDec, unsafe.Pointer(&blob[0]), C.int(len(blob)))
+		if ret != C.OPUS_UNIMPLEMENTED {
+			if err := opusError(ret); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (d *Decoder) enableDREDBlob(blob []byte) error {
+	if len(blob) == 0 {
+		return nil
+	}
+	ret := C.go_opus_dred_decoder_set_dnn_blob(
+		d.dredDec,
+		unsafe.Pointer(&blob[0]),
+		C.int(len(blob)),
+	)
+	if ret == C.OPUS_UNIMPLEMENTED {
+		return nil
+	}
+	if err := opusError(ret); err != nil {
+		return err
 	}
 	return nil
 }
@@ -230,14 +254,7 @@ func (d *Decoder) EnableDRED(blob []byte) error {
 	if d.dredState == nil {
 		return fmt.Errorf("opus_dred_alloc returned nil")
 	}
-	if len(blob) > 0 {
-		return opusError(C.go_opus_dred_decoder_set_dnn_blob(
-			d.dredDec,
-			unsafe.Pointer(&blob[0]),
-			C.int(len(blob)),
-		))
-	}
-	return nil
+	return d.enableDREDBlob(blob)
 }
 
 func (d *Decoder) Decode(packet []byte, frameSize int, decodeFEC bool, pcm []int16) (int, error) {
