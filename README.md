@@ -21,13 +21,16 @@
 │   ├── sender.c       # UDP 实时发送端
 │   └── receiver.c     # UDP 实时接收端（含抖动缓冲）
 ├── tools/
-│   ├── gen_audio.py   # 生成测试音频（正弦波/语音/调频/噪声）
-│   └── analyze.py     # 分析仿真结果（SNR/SegSNR/丢包分布）
+│   ├── gen_audio.py                 # 生成合成测试音频（正弦波/语音/调频/噪声）
+│   ├── prepare_representative_audio.py  # 下载代表性真实音频（music/news/dialogue）
+│   ├── analyze.py                   # 分析仿真结果（SNR/SegSNR/丢包分布）
+│   └── gen_rtc_report.py            # 从实验 CSV 生成 Markdown 报告
 ├── scripts/
-│   ├── run_experiments.sh  # 批量实验脚本
+│   ├── run_experiments.sh  # 批量离线仿真实验脚本
 │   └── run_udp_test.sh     # UDP 回环测试脚本
+├── webrtc_demo/       # Pion WebRTC 轻量 Demo（含 RTC 实验矩阵）
 ├── audio/             # 测试音频文件
-├── results/           # 仿真输出
+├── results/           # 仿真输出 + Markdown 报告
 ├── weights_blob.bin   # DRED/DeepPLC 神经网络权重
 └── CMakeLists.txt
 ```
@@ -50,7 +53,9 @@ make -j$(nproc)
 cd ..
 ```
 
-### 2. 生成测试音频
+### 2. 准备测试音频
+
+**方式 A：合成音频（离线快速测试）**
 
 ```bash
 python3 tools/gen_audio.py
@@ -61,6 +66,19 @@ python3 tools/gen_audio.py
 - `audio/sine_440hz.wav` — 纯正弦波
 - `audio/chirp_200_4000.wav` — 线性调频信号（用于频响测试）
 - `audio/speech_16k.wav` — 16kHz 语音（适合 LBRR 测试）
+
+**方式 B：代表性真实音频（推荐，需联网 + ffmpeg）**
+
+```bash
+python3 tools/prepare_representative_audio.py \
+    --out-dir audio --manifest audio/manifest.txt --clip-seconds 10
+```
+
+自动下载三类代表性音频并统一转码到 48kHz 单声道 WAV：
+
+- `music`：音乐片段（SoundHelix）
+- `news`：新闻播报片段（BBC podcast RSS 自动解析）
+- `dialogue`：多人对话场景片段（餐厅会话环境音）
 
 ### 3. 运行仿真
 
@@ -82,9 +100,15 @@ export LD_LIBRARY_PATH=$(pwd)/opus-install/lib:$LD_LIBRARY_PATH
 ./build/opus_sim -ge -ge-p2b 0.05 -ge-b2g 0.3 -ge-bloss 0.8 \
     -dred 5 audio/speech_like.wav results/ge_dred5.wav
 
-# 批量实验（完整测试矩阵）
+# 批量实验（使用代表性真实音频，默认 music/news/dialogue）
 bash scripts/run_experiments.sh
+
+# 使用合成音频运行
+AUDIO_MODE=synthetic bash scripts/run_experiments.sh
 ```
+
+批量实验脚本会自动下载 music/news/dialogue 三类音频，对每种音频执行完整实验矩阵，
+并在 `results/opus_report.md` 生成 Markdown 汇总报告。
 
 ---
 
@@ -292,8 +316,26 @@ bash scripts/run_test.sh
 
 ```bash
 cd webrtc_demo
+
+# 标准实验矩阵（5 场景 × 5 策略 × 3 音频 = 75 组）
 bash scripts/run_rtc_experiments.sh
+
+# 快速回归（2 场景 × 4 策略 × 3 音频 = 24 组）
+EXPERIMENT_SUITE=quick bash scripts/run_rtc_experiments.sh
+
+# 完整矩阵（含延迟抖动，6 场景 × 5 策略 × 3 音频 = 90 组）
+EXPERIMENT_SUITE=full bash scripts/run_rtc_experiments.sh
 ```
+
+实验完成后自动生成 `results/rtc_report.md`，包含：
+- **恢复策略表**：各音频类型下各保护方案的 LBRR/DRED/PLC 恢复帧数与恢复率
+- **SNR/SegSNR 表**：全局信噪比与分段信噪比对比
+
+默认实验会自动联网下载三类代表性音频并统一转码到 48kHz 单声道：
+
+- `music`：音乐片段（SoundHelix）
+- `news`：新闻播报片段（BBC podcast RSS 自动解析）
+- `dialogue`：多人对话场景片段（餐厅会话环境音）
 
 如果在 Cursor Cloud 中运行，建议在启动脚本执行：
 
