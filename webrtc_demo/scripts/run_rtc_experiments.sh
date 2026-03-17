@@ -14,6 +14,7 @@ set -euo pipefail
 #   - Markdown 报告       → $REPORT_MD
 #   - 输入/输出音频       → $RUN_DIR/inputs, $RUN_DIR/outputs
 #   - 统计 JSON / 日志     → $RUN_DIR/stats, $RUN_DIR/logs
+#   - 预编译二进制        → $BIN_DIR
 #
 # 环境变量:
 #   EXPERIMENT_SUITE  quick|standard|full (默认 standard)
@@ -23,6 +24,7 @@ set -euo pipefail
 #   RUN_ID            实验目录名 (默认时间戳)
 #   RUN_DIR           实验产物目录 (默认 results/rtc_runs/$RUN_ID)
 #   REP_AUDIO_CACHE_DIR 代表性音频缓存根目录
+#   BIN_DIR           sender/receiver/signaling 二进制缓存目录
 #   REPORT_MD         报告输出路径
 # ==========================================================================
 
@@ -44,9 +46,9 @@ SIGNAL_URL="http://127.0.0.1:${SIGNAL_PORT}"
 OPUS_PKG_CONFIG="${OPUS_PKG_CONFIG:-${WORKSPACE_DIR}/opus-install/lib/pkgconfig}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${WORKSPACE_DIR}/weights_blob.bin}"
 SIM_SEED="${SIM_SEED:-42}"
+CLIP_SECONDS="${CLIP_SECONDS:-10}"
 DEFAULT_RECV_DURATION="$((CLIP_SECONDS + 2))s"
 RECV_DURATION="${RECV_DURATION:-${DEFAULT_RECV_DURATION}}"
-CLIP_SECONDS="${CLIP_SECONDS:-10}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="${RUN_DIR:-${WORKSPACE_DIR}/results/rtc_runs/${RUN_ID}}"
 REP_AUDIO_CACHE_DIR="${REP_AUDIO_CACHE_DIR:-${WORKSPACE_DIR}/results/representative_audio_cache}"
@@ -60,10 +62,11 @@ SUMMARY_CSV="${SUMMARY_CSV:-${RUN_DIR}/rtc_experiment_summary.csv}"
 REPORT_MD="${REPORT_MD:-${RUN_DIR}/rtc_report.md}"
 LATEST_LINK="${WORKSPACE_DIR}/results/rtc_latest"
 LATEST_REPORT="${WORKSPACE_DIR}/results/rtc_report.md"
+BIN_DIR="${BIN_DIR:-${WORKSPACE_DIR}/results/rtc_bin_cache}"
 EXPERIMENT_SUITE="${EXPERIMENT_SUITE:-standard}"
 
 mkdir -p "${RUN_DIR}" "${INPUT_DIR}" "${OUTPUT_DIR}" "${STATS_DIR}" "${LOG_DIR}" \
-         "$(dirname "${LATEST_LINK}")" "$(dirname "${LATEST_REPORT}")"
+         "$(dirname "${LATEST_LINK}")" "$(dirname "${LATEST_REPORT}")" "${BIN_DIR}"
 
 export PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}:${PKG_CONFIG_PATH:-}"
 export LD_LIBRARY_PATH="${WORKSPACE_DIR}/opus-install/lib:${LD_LIBRARY_PATH:-}"
@@ -74,6 +77,18 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+build_binaries() {
+  echo "[exp] building rtc binaries into ${BIN_DIR}"
+  (
+    cd "${ROOT_DIR}"
+    go build -o "${BIN_DIR}/signaling" ./signaling
+    go build -o "${BIN_DIR}/receiver" ./receiver
+    go build -o "${BIN_DIR}/sender" ./sender
+  )
+}
+
+build_binaries
 
 # ---- 准备代表性音频 ----
 echo "[exp] preparing representative audio (clip=${CLIP_SECONDS}s)"
@@ -100,7 +115,7 @@ echo "audio_type,scenario,case,sim_mode,sim_loss,recovered_lbrr,recovered_dred,p
 echo "[exp] starting signaling server on ${SIGNAL_URL}"
 (
   cd "${ROOT_DIR}"
-  go run ./signaling -addr ":${SIGNAL_PORT}" >"${LOG_DIR}/signaling.log" 2>&1
+  "${BIN_DIR}/signaling" -addr ":${SIGNAL_PORT}" >"${LOG_DIR}/signaling.log" 2>&1
 ) &
 SIGNAL_PID=$!
 sleep 1
@@ -129,7 +144,7 @@ run_case() {
   echo "[exp] audio=${audio_type} scenario=${scenario_name} case=${case_name}"
   (
     cd "${ROOT_DIR}"
-    go run ./receiver \
+    "${BIN_DIR}/receiver" \
       --signal "${SIGNAL_URL}" \
       --session "${session}" \
       --output "${output_wav}" \
@@ -145,7 +160,7 @@ run_case() {
 
   (
     cd "${ROOT_DIR}"
-    go run ./sender \
+    "${BIN_DIR}/sender" \
       --signal "${SIGNAL_URL}" \
       --session "${session}" \
       --input "${input_wav}" \
@@ -265,6 +280,7 @@ echo " 丢包场景   : ${n_scenarios}"
 echo " 保护策略   : ${n_strategies}"
 echo " 总实验数   : ${total}"
 echo " 接收时长   : ${RECV_DURATION}"
+echo " 二进制缓存 : ${BIN_DIR}"
 echo " 报告输出   : ${REPORT_MD}"
 echo "========================================================"
 echo ""
