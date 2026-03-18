@@ -26,6 +26,7 @@ func main() {
 		enableFEC    bool
 		enableVBR    bool
 		complexity   int
+		signalHint   string
 		dredDuration int
 		dnnBlobPath  string
 		connectWait  time.Duration
@@ -41,6 +42,7 @@ func main() {
 	flag.BoolVar(&enableFEC, "fec", true, "enable opus in-band FEC")
 	flag.BoolVar(&enableVBR, "vbr", true, "enable opus VBR")
 	flag.IntVar(&complexity, "complexity", 9, "opus complexity (0-10)")
+	flag.StringVar(&signalHint, "signal-hint", "auto", "opus signal hint: auto|voice|music")
 	flag.IntVar(&dredDuration, "dred", 0, "opus dred duration in 10ms units, 0 to disable")
 	flag.StringVar(&dnnBlobPath, "weights", "../weights_blob.bin", "path to DNN blob file for DRED")
 	flag.DurationVar(&connectWait, "connect-timeout", 10*time.Second, "peer connection timeout")
@@ -172,6 +174,22 @@ func main() {
 	}
 	if err := encoder.SetComplexity(complexity); err != nil {
 		log.Fatalf("set encoder complexity failed: %v", err)
+	}
+	switch signalHint {
+	case "auto":
+		if err := encoder.SetSignal(opusx.SignalAuto); err != nil {
+			log.Fatalf("set signal hint failed: %v", err)
+		}
+	case "voice":
+		if err := encoder.SetSignal(opusx.SignalVoice); err != nil {
+			log.Fatalf("set signal hint failed: %v", err)
+		}
+	case "music":
+		if err := encoder.SetSignal(opusx.SignalMusic); err != nil {
+			log.Fatalf("set signal hint failed: %v", err)
+		}
+	default:
+		log.Fatalf("unsupported --signal-hint=%s, expected auto|voice|music", signalHint)
 	}
 	if err := encoder.SetInBandFEC(enableFEC); err != nil {
 		log.Fatalf("set in-band fec failed: %v", err)

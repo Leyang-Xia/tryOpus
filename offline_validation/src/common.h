@@ -51,6 +51,7 @@ typedef struct {
     int use_vbr;           /* 可变码率 VBR: 0=CBR, 1=VBR */
     int dred_duration;     /* DRED冗余帧数 (单位: 10ms帧), 0=禁用 */
     int complexity;        /* 编码复杂度 0-10 */
+    int signal_type;       /* OPUS_AUTO / OPUS_SIGNAL_VOICE / OPUS_SIGNAL_MUSIC */
     int lsb_depth;         /* 输入音频有效位深, 通常16 */
 } EncoderConfig;
 

@@ -27,6 +27,7 @@ set -euo pipefail
 #   REPORT_MD         报告输出路径
 #   ASR_PYTHON        用于生成 WER/SER 报告的 Python (默认 .venv_asr/bin/python, 否则 python3)
 #   STT_MODEL         Whisper 模型名 (默认 small.en)
+#   RTC_STT_BACKEND   ASR 后端: mlx|faster|auto (默认 Apple Silicon 上为 mlx)
 # ==========================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -66,6 +67,8 @@ LATEST_REPORT="${WORKSPACE_DIR}/results/rtc_report.md"
 BIN_DIR="${BIN_DIR:-${WORKSPACE_DIR}/results/rtc_bin_cache}"
 ASR_PYTHON="${ASR_PYTHON:-${WORKSPACE_DIR}/.venv_asr/bin/python}"
 STT_MODEL="${STT_MODEL:-small.en}"
+SENDER_COMPLEXITY="${SENDER_COMPLEXITY:-9}"
+SENDER_SIGNAL="${SENDER_SIGNAL:-auto}"
 EXPERIMENT_SUITE="${EXPERIMENT_SUITE:-standard}"
 
 if [[ ! -x "${ASR_PYTHON}" ]]; then
@@ -178,6 +181,8 @@ run_case() {
       --signal "${SIGNAL_URL}" \
       --session "${session}" \
       --input "${input_wav}" \
+      --complexity "${SENDER_COMPLEXITY}" \
+      --signal-hint "${SENDER_SIGNAL}" \
       --weights "${WEIGHTS_PATH}" ${sender_extra} \
       >"${LOG_DIR}/${audio_type}_${scenario_name}_${case_name}_sender.log" 2>&1
   )
@@ -293,6 +298,8 @@ echo " 丢包场景   : ${n_scenarios}"
 echo " 保护策略   : ${n_strategies}"
 echo " 总实验数   : ${total}"
 echo " 接收时长   : ${RECV_DURATION}"
+echo " 编码复杂度 : ${SENDER_COMPLEXITY}"
+echo " Signal提示 : ${SENDER_SIGNAL}"
 echo " 二进制缓存 : ${BIN_DIR}"
 echo " 报告输出   : ${REPORT_MD}"
 echo "========================================================"
@@ -318,7 +325,7 @@ while IFS='|' read -r audio_type input_wav; do
   done
 done < "${AUDIO_MANIFEST}"
 
-# ---- 生成 Markdown 报告 ----
+# Generate Markdown report.
 echo ""
 echo "[exp] generating Markdown report..."
 mkdir -p "$(dirname "${REPORT_MD}")"

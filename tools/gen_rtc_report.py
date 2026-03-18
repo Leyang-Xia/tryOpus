@@ -33,6 +33,11 @@ except ImportError:
     WhisperModel = None
     jiwer_wer = None
 
+try:
+    import mlx_whisper
+except ImportError:
+    mlx_whisper = None
+
 
 # --------------- WAV 读取 ---------------
 
@@ -210,6 +215,31 @@ def _edit_distance(ref_units: List[str], hyp_units: List[str]) -> int:
 
 _MODEL_CACHE = {}
 _RESOLVED_MODEL_NAME = None
+_RESOLVED_BACKEND = None
+
+
+def _default_stt_backend() -> str:
+    backend = os.environ.get("RTC_STT_BACKEND")
+    if backend:
+        return backend
+    if sys.platform == "darwin" and os.uname().machine == "arm64":
+        return "mlx"
+    return "faster"
+
+
+def _mlx_repo_for_model(model_name: str) -> str:
+    aliases = {
+        "tiny": "mlx-community/whisper-tiny-mlx",
+        "tiny.en": "mlx-community/whisper-tiny.en-mlx",
+        "base": "mlx-community/whisper-base-mlx",
+        "base.en": "mlx-community/whisper-base.en-mlx",
+        "small": "mlx-community/whisper-small-mlx",
+        "small.en": "mlx-community/whisper-small.en-mlx",
+        "medium": "mlx-community/whisper-medium-mlx",
+        "medium.en": "mlx-community/whisper-medium.en-mlx",
+        "large-v3": "mlx-community/whisper-large-v3-mlx",
+    }
+    return aliases.get(model_name, model_name)
 
 
 def _load_whisper_model(model_name: str):
@@ -217,7 +247,7 @@ def _load_whisper_model(model_name: str):
         raise RuntimeError(
             "faster-whisper is not installed; use the repo .venv_asr Python or install the ASR dependencies."
         )
-    global _RESOLVED_MODEL_NAME
+    global _RESOLVED_MODEL_NAME, _RESOLVED_BACKEND
     device = os.environ.get("RTC_STT_DEVICE", "cpu")
     compute_type = os.environ.get("RTC_STT_COMPUTE_TYPE", "int8")
     download_root = os.environ.get("RTC_STT_DOWNLOAD_ROOT")
@@ -237,6 +267,7 @@ def _load_whisper_model(model_name: str):
     for candidate in candidates:
         if candidate in _MODEL_CACHE:
             _RESOLVED_MODEL_NAME = candidate
+            _RESOLVED_BACKEND = "faster"
             return _MODEL_CACHE[candidate]
         try:
             _MODEL_CACHE[candidate] = WhisperModel(
@@ -253,6 +284,7 @@ def _load_whisper_model(model_name: str):
                     file=sys.stderr,
                 )
             _RESOLVED_MODEL_NAME = candidate
+            _RESOLVED_BACKEND = "faster"
             return _MODEL_CACHE[candidate]
         except Exception as exc:
             last_exc = exc
@@ -265,23 +297,69 @@ def _load_whisper_model(model_name: str):
     raise last_exc
 
 
+def _mlx_available() -> bool:
+    return mlx_whisper is not None
+
+
+def _transcribe_audio_segments_mlx(
+    path: str, model_name: str, language: Optional[str]
+) -> Tuple[str, List[str]]:
+    if not _mlx_available():
+        raise RuntimeError("mlx-whisper is not installed in the ASR environment.")
+    global _RESOLVED_MODEL_NAME, _RESOLVED_BACKEND
+    mlx_repo = _mlx_repo_for_model(model_name)
+    decode_options = {
+        "language": language,
+        "condition_on_previous_text": False,
+        "word_timestamps": False,
+    }
+    decode_options = {k: v for k, v in decode_options.items() if v is not None}
+    result = mlx_whisper.transcribe(path, path_or_hf_repo=mlx_repo, **decode_options)
+    text = (result.get("text") or "").strip()
+    raw_segments = [seg.get("text", "").strip() for seg in result.get("segments", []) if seg.get("text", "").strip()]
+    normalized_segments = [_normalize_transcript(seg) for seg in raw_segments]
+    normalized_segments = [seg for seg in normalized_segments if seg]
+    _RESOLVED_MODEL_NAME = mlx_repo
+    _RESOLVED_BACKEND = "mlx"
+    return text, normalized_segments
+
+
 def _transcribe_audio_segments(
     path: str, model_name: str, language: Optional[str]
 ) -> Tuple[str, List[str]]:
-    model = _load_whisper_model(model_name)
-    beam_size = int(os.environ.get("RTC_STT_BEAM_SIZE", "1"))
-    segments, _ = model.transcribe(
-        path,
-        beam_size=beam_size,
-        condition_on_previous_text=False,
-        vad_filter=False,
-        language=language,
-        word_timestamps=False,
-    )
-    raw_segments = [seg.text.strip() for seg in segments if seg.text.strip()]
-    normalized_segments = [_normalize_transcript(seg) for seg in raw_segments]
-    normalized_segments = [seg for seg in normalized_segments if seg]
-    return " ".join(raw_segments).strip(), normalized_segments
+    backend = _default_stt_backend()
+    errors = []
+    if backend in {"mlx", "auto"}:
+        try:
+            return _transcribe_audio_segments_mlx(path, model_name, language)
+        except Exception as exc:
+            errors.append(f"mlx failed: {exc}")
+            if backend == "mlx":
+                print(f"[report] mlx backend failed, falling back to faster-whisper: {exc}", file=sys.stderr)
+    try:
+        model = _load_whisper_model(model_name)
+        beam_size = int(os.environ.get("RTC_STT_BEAM_SIZE", "1"))
+        segments, _ = model.transcribe(
+            path,
+            beam_size=beam_size,
+            condition_on_previous_text=False,
+            vad_filter=False,
+            language=language,
+            word_timestamps=False,
+        )
+        raw_segments = [seg.text.strip() for seg in segments if seg.text.strip()]
+        normalized_segments = [_normalize_transcript(seg) for seg in raw_segments]
+        normalized_segments = [seg for seg in normalized_segments if seg]
+        return " ".join(raw_segments).strip(), normalized_segments
+    except Exception as exc:
+        errors.append(f"faster-whisper failed: {exc}")
+        raise RuntimeError("; ".join(errors))
+
+
+def _resolved_asr_summary(requested_model: str) -> str:
+    backend = _RESOLVED_BACKEND or _default_stt_backend()
+    resolved_model = _RESOLVED_MODEL_NAME or requested_model
+    return f"{backend} / {resolved_model}"
 
 
 def _write_text(path: str, text: str) -> None:
@@ -443,6 +521,7 @@ def generate_rtc_report(
         lines.append(f"| `{s}` | {label} |")
     lines.append("")
     lines.append("### 文本指标说明\n")
+    lines.append(f"- 当前报告 ASR 后端/模型：`{_resolved_asr_summary(stt_model)}`。")
     lines.append("- WER / SER 使用同一个 ASR 后端分别转写干净输入音频与 RTC 输出音频。")
     lines.append("- 干净输入音频的转写结果作为参考文本，因此这里衡量的是相对可懂度退化，而不是人工标注基准上的绝对识别率。")
     lines.append("- SER 只有在音频中包含足够多、边界清晰的句子时才更有解释力，因此默认代表性语音片段已提升到 30 秒。")
@@ -575,6 +654,7 @@ def generate_opus_report(
     lines.append("")
 
     lines.append("## 文本指标说明\n")
+    lines.append(f"- 当前报告 ASR 后端/模型：`{_resolved_asr_summary(stt_model)}`。")
     lines.append("- WER / SER 使用同一个 ASR 后端分别转写干净输入音频与离线输出音频。")
     lines.append("- `dialogue` 优先使用仓库内置参考文本，`news` 使用干净输入音频的转写结果作为参考文本。")
     lines.append("- 这里衡量的是不同恢复策略对可懂度的相对退化，作为离线回归的主评估指标。")

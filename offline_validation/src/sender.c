@@ -93,6 +93,7 @@ static void parse_sender_args(int argc, char **argv, SenderConfig *cfg) {
     cfg->enc_cfg.use_vbr          = 0;
     cfg->enc_cfg.dred_duration    = 0;
     cfg->enc_cfg.complexity       = 9;
+    cfg->enc_cfg.signal_type      = OPUS_AUTO;
 
     cfg->net_cfg.loss_model    = LOSS_UNIFORM;
     cfg->net_cfg.loss_rate     = 0.0f;
@@ -113,6 +114,12 @@ static void parse_sender_args(int argc, char **argv, SenderConfig *cfg) {
         else if (!strcmp(argv[i], "-dred")) cfg->enc_cfg.dred_duration = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-dtx"))  cfg->enc_cfg.use_dtx = 1;
         else if (!strcmp(argv[i], "-vbr"))  cfg->enc_cfg.use_vbr = 1;
+        else if (!strcmp(argv[i], "--signal")) {
+            const char *s = argv[++i];
+            if      (!strcmp(s, "auto"))  cfg->enc_cfg.signal_type = OPUS_AUTO;
+            else if (!strcmp(s, "voice")) cfg->enc_cfg.signal_type = OPUS_SIGNAL_VOICE;
+            else if (!strcmp(s, "music")) cfg->enc_cfg.signal_type = OPUS_SIGNAL_MUSIC;
+        }
         else if (!strcmp(argv[i], "-l"))    cfg->net_cfg.loss_rate = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "-ge"))   cfg->net_cfg.loss_model = LOSS_GILBERT;
         else if (!strcmp(argv[i], "-ge-p2b")) cfg->net_cfg.p_good_to_bad = (float)atof(argv[++i]);
@@ -172,6 +179,7 @@ int main(int argc, char **argv) {
                               cfg.enc_cfg.packet_loss_perc));
     opus_encoder_ctl(enc, OPUS_SET_DTX(cfg.enc_cfg.use_dtx));
     opus_encoder_ctl(enc, OPUS_SET_VBR(cfg.enc_cfg.use_vbr));
+    opus_encoder_ctl(enc, OPUS_SET_SIGNAL(cfg.enc_cfg.signal_type));
     if (cfg.enc_cfg.dred_duration > 0)
         opus_encoder_ctl(enc, OPUS_SET_DRED_DURATION(
                                   cfg.enc_cfg.dred_duration));
