@@ -352,15 +352,6 @@ RTC 实验默认直接复用仓库内置的两类 30 秒基线语音音频：
 如果更关心回归速度而不是识别稳定性，可在运行前覆盖 `STT_MODEL=base.en`。
 
 默认标准集固定为 30 秒，以便 `SER` 在对话与新闻样本上有足够多的句子可比较。
-
-如果在 Cursor Cloud 中运行，建议在启动脚本执行：
-
-```bash
-bash scripts/cursor_cloud_startup.sh
-```
-
-该脚本会保证 Go `>=1.22`，并预热 `webrtc_demo` 的 Go 依赖。
-
 ---
 
 ## 依赖
