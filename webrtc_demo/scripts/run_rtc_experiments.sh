@@ -5,9 +5,9 @@ set -euo pipefail
 # run_rtc_experiments.sh - RTC 传输模拟实验矩阵
 #
 # 实验矩阵:
-#   音频类型  : music / news / dialogue（自动下载代表性音频）
+#   音频类型  : 固定 news / dialogue（来自顶层 representative_audio/）
 #   丢包场景  : 均匀 5%/10%/20%, GE 中等/重度突发, 延迟+抖动+10%
-#   保护策略  : baseline(无保护), LBRR, DRED-3, DRED-5, LBRR+DRED-3
+#   保护策略  : baseline(无保护), LBRR, DRED-3, DRED-5
 #
 # 输出:
 #   - 汇总 CSV            → $SUMMARY_CSV
@@ -18,14 +18,15 @@ set -euo pipefail
 #
 # 环境变量:
 #   EXPERIMENT_SUITE  quick|standard|full (默认 standard)
-#   RECV_DURATION     接收时长 (默认 CLIP_SECONDS + 2s)
-#   CLIP_SECONDS      音频剪辑时长 (默认 10)
+#   RECV_DURATION     接收时长 (默认 32s)
 #   SIM_SEED          随机种子 (默认 42)
 #   RUN_ID            实验目录名 (默认时间戳)
 #   RUN_DIR           实验产物目录 (默认 results/rtc_runs/$RUN_ID)
-#   REP_AUDIO_CACHE_DIR 代表性音频缓存根目录
+#   REP_AUDIO_DIR     代表性音频根目录 (默认 <repo>/representative_audio)
 #   BIN_DIR           sender/receiver/signaling 二进制缓存目录
 #   REPORT_MD         报告输出路径
+#   ASR_PYTHON        用于生成 WER/SER 报告的 Python (默认 .venv_asr/bin/python, 否则 python3)
+#   STT_MODEL         Whisper 模型名 (默认 small.en)
 # ==========================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,26 +47,32 @@ SIGNAL_URL="http://127.0.0.1:${SIGNAL_PORT}"
 OPUS_PKG_CONFIG="${OPUS_PKG_CONFIG:-${WORKSPACE_DIR}/opus-install/lib/pkgconfig}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${WORKSPACE_DIR}/weights_blob.bin}"
 SIM_SEED="${SIM_SEED:-42}"
-CLIP_SECONDS="${CLIP_SECONDS:-10}"
-DEFAULT_RECV_DURATION="$((CLIP_SECONDS + 2))s"
+REP_AUDIO_DIR="${REP_AUDIO_DIR:-${WORKSPACE_DIR}/representative_audio}"
+REP_AUDIO_MANIFEST="${REP_AUDIO_DIR}/manifest.txt"
+DEFAULT_RECV_DURATION="32s"
 RECV_DURATION="${RECV_DURATION:-${DEFAULT_RECV_DURATION}}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="${RUN_DIR:-${WORKSPACE_DIR}/results/rtc_runs/${RUN_ID}}"
-REP_AUDIO_CACHE_DIR="${REP_AUDIO_CACHE_DIR:-${WORKSPACE_DIR}/results/representative_audio_cache}"
-CACHE_DIR="${REP_AUDIO_CACHE_DIR}/clip_${CLIP_SECONDS}s"
 INPUT_DIR="${RUN_DIR}/inputs"
 OUTPUT_DIR="${RUN_DIR}/outputs"
 STATS_DIR="${RUN_DIR}/stats"
 LOG_DIR="${RUN_DIR}/logs"
+TRANSCRIPT_DIR="${RUN_DIR}/transcripts"
 AUDIO_MANIFEST="${AUDIO_MANIFEST:-${RUN_DIR}/audio_manifest.txt}"
 SUMMARY_CSV="${SUMMARY_CSV:-${RUN_DIR}/rtc_experiment_summary.csv}"
 REPORT_MD="${REPORT_MD:-${RUN_DIR}/rtc_report.md}"
 LATEST_LINK="${WORKSPACE_DIR}/results/rtc_latest"
 LATEST_REPORT="${WORKSPACE_DIR}/results/rtc_report.md"
 BIN_DIR="${BIN_DIR:-${WORKSPACE_DIR}/results/rtc_bin_cache}"
+ASR_PYTHON="${ASR_PYTHON:-${WORKSPACE_DIR}/.venv_asr/bin/python}"
+STT_MODEL="${STT_MODEL:-small.en}"
 EXPERIMENT_SUITE="${EXPERIMENT_SUITE:-standard}"
 
-mkdir -p "${RUN_DIR}" "${INPUT_DIR}" "${OUTPUT_DIR}" "${STATS_DIR}" "${LOG_DIR}" \
+if [[ ! -x "${ASR_PYTHON}" ]]; then
+  ASR_PYTHON="${ASR_PYTHON_FALLBACK:-python3}"
+fi
+
+mkdir -p "${RUN_DIR}" "${INPUT_DIR}" "${OUTPUT_DIR}" "${STATS_DIR}" "${LOG_DIR}" "${TRANSCRIPT_DIR}" \
          "$(dirname "${LATEST_LINK}")" "$(dirname "${LATEST_REPORT}")" "${BIN_DIR}"
 
 export PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}:${PKG_CONFIG_PATH:-}"
@@ -90,22 +97,29 @@ build_binaries() {
 
 build_binaries
 
-# ---- 准备代表性音频 ----
-echo "[exp] preparing representative audio (clip=${CLIP_SECONDS}s)"
-mkdir -p "${CACHE_DIR}"
-python3 "${WORKSPACE_DIR}/tools/prepare_representative_audio.py" \
-  --out-dir "${CACHE_DIR}" \
-  --cache-dir "${CACHE_DIR}" \
-  --manifest "${CACHE_DIR}/manifest.txt" \
-  --clip-seconds "${CLIP_SECONDS}"
+# ---- 检查代表性音频 ----
+if [[ ! -f "${REP_AUDIO_MANIFEST}" ]]; then
+  echo "[exp] missing representative audio manifest: ${REP_AUDIO_MANIFEST}" >&2
+  echo "[exp] run: python3 tools/prepare_representative_audio.py --force" >&2
+  exit 1
+fi
 
 : > "${AUDIO_MANIFEST}"
-while IFS='|' read -r audio_type cached_wav; do
+while IFS='|' read -r audio_type rel_wav; do
   [[ -z "${audio_type}" ]] && continue
+  cached_wav="${REP_AUDIO_DIR}/${rel_wav}"
+  if [[ ! -f "${cached_wav}" ]]; then
+    echo "[exp] missing representative wav: ${cached_wav}" >&2
+    exit 1
+  fi
   input_wav="${INPUT_DIR}/${audio_type}.wav"
   cp "${cached_wav}" "${input_wav}"
+  sidecar_ref="$(dirname "${cached_wav}")/${audio_type}_reference.txt"
+  if [[ -f "${sidecar_ref}" ]]; then
+    cp "${sidecar_ref}" "${INPUT_DIR}/${audio_type}_reference.txt"
+  fi
   echo "${audio_type}|${input_wav}" >> "${AUDIO_MANIFEST}"
-done < "${CACHE_DIR}/manifest.txt"
+done < "${REP_AUDIO_MANIFEST}"
 
 # ---- CSV header ----
 echo "audio_type,scenario,case,sim_mode,sim_loss,recovered_lbrr,recovered_dred,plc,decode_errors,recovery_rate,input_wav,output_wav,stats_json" \
@@ -206,7 +220,6 @@ declare -a STRATEGIES_QUICK=(
   "baseline|--fec=false --dred=0 --plp=0|--use-lbrr=false --use-dred=false"
   "lbrr_only|--fec=true --dred=0 --plp=15|--use-lbrr=true --use-dred=false"
   "dred_3|--fec=false --dred=3 --plp=15|--use-lbrr=false --use-dred=true"
-  "lbrr_dred_3|--fec=true --dred=3 --plp=15 --bitrate=64000 --vbr=true|--use-lbrr=true --use-dred=true"
 )
 
 declare -a STRATEGIES_FULL=(
@@ -214,7 +227,6 @@ declare -a STRATEGIES_FULL=(
   "lbrr_only|--fec=true --dred=0 --plp=15|--use-lbrr=true --use-dred=false"
   "dred_3|--fec=false --dred=3 --plp=15|--use-lbrr=false --use-dred=true"
   "dred_5|--fec=false --dred=5 --plp=15|--use-lbrr=false --use-dred=true"
-  "lbrr_dred_3|--fec=true --dred=3 --plp=15 --bitrate=64000 --vbr=true|--use-lbrr=true --use-dred=true"
 )
 
 # ================================================================
@@ -275,6 +287,7 @@ echo "========================================================"
 echo " RTC 传输实验矩阵"
 echo "========================================================"
 echo " 实验套件   : ${EXPERIMENT_SUITE}"
+echo " 音频清单   : ${REP_AUDIO_MANIFEST}"
 echo " 音频类型   : ${n_audio}"
 echo " 丢包场景   : ${n_scenarios}"
 echo " 保护策略   : ${n_strategies}"
@@ -309,9 +322,11 @@ done < "${AUDIO_MANIFEST}"
 echo ""
 echo "[exp] generating Markdown report..."
 mkdir -p "$(dirname "${REPORT_MD}")"
-python3 "${WORKSPACE_DIR}/tools/gen_rtc_report.py" \
+"${ASR_PYTHON}" "${WORKSPACE_DIR}/tools/gen_rtc_report.py" \
   --csv "${SUMMARY_CSV}" \
   --output "${REPORT_MD}" \
+  --transcript-dir "${TRANSCRIPT_DIR}" \
+  --stt-model "${STT_MODEL}" \
   --mode rtc
 
 cp "${REPORT_MD}" "${LATEST_REPORT}"
@@ -326,6 +341,7 @@ echo " 汇总 CSV    : ${SUMMARY_CSV}"
 echo " Markdown 报告: ${REPORT_MD}"
 echo " 输入音频目录 : ${INPUT_DIR}"
 echo " 输出音频目录 : ${OUTPUT_DIR}"
+echo " 转写目录    : ${TRANSCRIPT_DIR}"
 echo " 统计 JSON 目录: ${STATS_DIR}"
 echo " 日志目录    : ${LOG_DIR}"
 echo " 最新报告    : ${LATEST_REPORT}"

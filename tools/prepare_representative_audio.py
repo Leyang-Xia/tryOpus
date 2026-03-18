@@ -1,133 +1,206 @@
 #!/usr/bin/env python3
 """
-prepare_representative_audio.py - 下载三类代表性音频并转码为 48kHz 单声道 WAV
+prepare_representative_audio.py - 更新仓库内置的 30s 代表性语音基线素材
 
-音频类型:
-  music    - 音乐片段（SoundHelix）
-  news     - 新闻播报片段（BBC podcast RSS 自动解析）
-  dialogue - 多人对话场景片段（餐厅会话环境音）
+输出目录:
+  representative_audio/
+    manifest.txt
+    news/news_30s_48k_mono.wav
+    dialogue/dialogue_30s_48k_mono.wav
+    dialogue/dialogue_reference.txt
 
 用法:
-  python3 tools/prepare_representative_audio.py \\
-      --out-dir /tmp/audio --manifest /tmp/manifest.txt --clip-seconds 10
+  python3 tools/prepare_representative_audio.py
+  python3 tools/prepare_representative_audio.py --force
+  python3 tools/prepare_representative_audio.py --out-dir /tmp/representative_audio --force
 """
 
 import argparse
-import os
 import pathlib
-import re
 import shutil
 import subprocess
-import urllib.request
+import tempfile
 from dataclasses import dataclass
+from typing import Optional
 
 
-@dataclass
+ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
+DEFAULT_OUT_DIR = ROOT_DIR / "representative_audio"
+CLIP_SECONDS = 30
+
+
+@dataclass(frozen=True)
 class AudioSpec:
     audio_type: str
     source_url: str
-    clip_seconds: int
+    relative_wav: str
+    start_offset_seconds: float = 0.0
+    reference_text: Optional[str] = None
 
 
-def _extract_clip_to_wav(src: str, dst: pathlib.Path, clip_seconds: int) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
+DIALOGUE_REFERENCE = (
+    "Conversation one.\n"
+    "Do you have a bike I can borrow?\n"
+    "Yeah, I have one, but it's very old.\n"
+    "Does it run well?\n"
+    "Yeah, it works, but it might need a new tire.\n"
+    "You know, I think I have one in the garage.\n"
+    "Perfect. Then you are all set.\n"
+    "Conversation two.\n"
+    "Would you like a cookie?\n"
+    "I would love one. Did you make them yourself?\n"
+    "No."
+)
+
+
+SPECS = (
+    AudioSpec(
+        audio_type="news",
+        source_url="https://voa-audio.voanews.eu/lere/2014/07/17/0e5a707a-9185-4ecc-ac0f-3b452905192a.mp3?download=1",
+        relative_wav="news/news_30s_48k_mono.wav",
+        start_offset_seconds=20.0,
+    ),
+    AudioSpec(
+        audio_type="dialogue",
+        source_url="https://elllo.org/Audio/SoundGrammar/A2-Audio/A2-25-One-It.mp3",
+        relative_wav="dialogue/dialogue_30s_48k_mono.wav",
+        reference_text=DIALOGUE_REFERENCE,
+    ),
+)
+
+
+def _probe_duration_seconds(path: pathlib.Path) -> float:
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-t", str(clip_seconds),
-        "-i", src,
-        "-ac", "1", "-ar", "48000",
-        str(dst),
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=nk=1:nw=1",
+        str(path),
     ]
-    subprocess.run(cmd, check=True, timeout=max(60, clip_seconds * 10))
+    out = subprocess.check_output(cmd, text=True, timeout=30).strip()
+    return float(out)
 
 
-def _resolve_news_url(default_url: str) -> str:
-    if os.environ.get("REP_AUDIO_PREFER_LIVE_NEWS", "").lower() not in {"1", "true", "yes"}:
-        return default_url
-    rss_url = "https://podcasts.files.bbci.co.uk/p02nq0gn.rss"
-    try:
-        with urllib.request.urlopen(rss_url, timeout=15) as resp:
-            xml = resp.read().decode("utf-8", errors="ignore")
-        m = re.search(r'<enclosure url="([^"]+\.mp3)"', xml)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return default_url
+def _download_to_temp(src: str, tmpdir: pathlib.Path) -> pathlib.Path:
+    suffix = pathlib.Path(src).suffix or ".bin"
+    tmp_src = tmpdir / f"source{suffix}"
+    curl_cmd = [
+        "curl",
+        "-L",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "600",
+        "-o",
+        str(tmp_src),
+        src,
+    ]
+    subprocess.run(curl_cmd, check=True, timeout=660)
+    return tmp_src
+
+
+def _extract_clip_to_wav(src: str, dst: pathlib.Path, clip_seconds: int, start_offset_seconds: float) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = pathlib.Path(tmp)
+        input_src = _download_to_temp(src, tmpdir) if src.startswith(("http://", "https://")) else pathlib.Path(src)
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{start_offset_seconds:.3f}",
+            "-t",
+            str(clip_seconds),
+            "-i",
+            str(input_src),
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            str(dst),
+        ]
+        subprocess.run(cmd, check=True, timeout=240)
+
+    duration = _probe_duration_seconds(dst)
+    if duration < clip_seconds - 0.5:
+        raise RuntimeError(
+            f"prepared clip is too short for {dst.name}: got {duration:.2f}s, expected about {clip_seconds}s"
+        )
+
+
+def _write_manifest(out_dir: pathlib.Path) -> None:
+    manifest_path = out_dir / "manifest.txt"
+    lines = [f"{spec.audio_type}|{spec.relative_wav}" for spec in SPECS]
+    manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_reference(out_dir: pathlib.Path, spec: AudioSpec) -> None:
+    if not spec.reference_text:
+        return
+    ref_path = out_dir / pathlib.Path(spec.relative_wav).parent / f"{spec.audio_type}_reference.txt"
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    ref_path.write_text(spec.reference_text + "\n", encoding="utf-8")
+
+
+def _validate_output(out_dir: pathlib.Path) -> None:
+    manifest_path = out_dir / "manifest.txt"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"missing manifest: {manifest_path}")
+
+    for spec in SPECS:
+        wav_path = out_dir / spec.relative_wav
+        if not wav_path.is_file():
+            raise RuntimeError(f"missing wav: {wav_path}")
+        duration = _probe_duration_seconds(wav_path)
+        if duration < CLIP_SECONDS - 0.5:
+            raise RuntimeError(f"unexpected wav duration for {wav_path}: {duration:.2f}s")
+        if spec.reference_text:
+            ref_path = wav_path.parent / f"{spec.audio_type}_reference.txt"
+            if not ref_path.is_file():
+                raise RuntimeError(f"missing reference transcript: {ref_path}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Download representative internet audio and normalize to 48k mono wav.")
-    parser.add_argument("--out-dir", required=True,
-                        help="Directory for output wav files")
-    parser.add_argument("--manifest", required=True,
-                        help="Manifest output path, each line: audio_type|wav_path")
-    parser.add_argument("--cache-dir",
-                        help="Optional persistent cache dir for normalized wav files; defaults to --out-dir")
-    parser.add_argument("--clip-seconds", type=int, default=10,
-                        help="Clip length in seconds for each sample")
-    parser.add_argument("--force", action="store_true",
-                        help="Redownload and reconvert even if cached files already exist")
+    parser = argparse.ArgumentParser(description="Refresh repo-tracked representative audio assets.")
+    parser.add_argument(
+        "--out-dir",
+        default=str(DEFAULT_OUT_DIR),
+        help="Representative audio root directory; defaults to <repo>/representative_audio",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Redownload and reconvert the baseline wav files even if they already exist",
+    )
     args = parser.parse_args()
 
     out_dir = pathlib.Path(args.out_dir).resolve()
-    cache_dir = pathlib.Path(args.cache_dir).resolve() if args.cache_dir else out_dir
-    wav_dir = cache_dir / "wav"
-    manifest_path = pathlib.Path(args.manifest).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    news_fallback = "https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/mlk.flac"
-    specs = [
-        AudioSpec(
-            audio_type="music",
-            source_url="https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
-            clip_seconds=args.clip_seconds,
-        ),
-        AudioSpec(
-            audio_type="news",
-            source_url=_resolve_news_url(news_fallback),
-            clip_seconds=args.clip_seconds,
-        ),
-        AudioSpec(
-            audio_type="dialogue",
-            source_url="https://bigsoundbank.com/UPLOAD/mp3/3542.mp3",
-            clip_seconds=args.clip_seconds,
-        ),
-    ]
-
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = []
-
-    for spec in specs:
-        wav_path = wav_dir / f"{spec.audio_type}_48k_mono.wav"
-        out_wav_path = out_dir / "wav" / f"{spec.audio_type}_48k_mono.wav"
-
-        if args.force or not wav_path.exists():
-            print(f"[audio] extracting {spec.clip_seconds}s clip for {spec.audio_type} from {spec.source_url}")
-            _extract_clip_to_wav(spec.source_url, wav_path, spec.clip_seconds)
+    for spec in SPECS:
+        wav_path = out_dir / spec.relative_wav
+        needs_build = args.force or not wav_path.exists()
+        if needs_build:
+            print(
+                f"[audio] extracting {spec.audio_type} -> {wav_path} "
+                f"(start={spec.start_offset_seconds:.1f}s, duration={CLIP_SECONDS}s)"
+            )
+            _extract_clip_to_wav(spec.source_url, wav_path, CLIP_SECONDS, spec.start_offset_seconds)
         else:
-            print(f"[audio] reuse cached wav {spec.audio_type}: {wav_path}")
+            print(f"[audio] reuse existing wav {spec.audio_type}: {wav_path}")
+        _write_reference(out_dir, spec)
 
-        out_wav_path.parent.mkdir(parents=True, exist_ok=True)
-        if out_wav_path != wav_path:
-            if args.force or not out_wav_path.exists():
-                print(f"[audio] copying {spec.audio_type} wav -> {out_wav_path}")
-                shutil.copy2(wav_path, out_wav_path)
-            else:
-                src_mtime = wav_path.stat().st_mtime
-                dst_mtime = out_wav_path.stat().st_mtime
-                if src_mtime > dst_mtime or os.path.getsize(out_wav_path) != os.path.getsize(wav_path):
-                    print(f"[audio] refreshing copied wav {spec.audio_type} -> {out_wav_path}")
-                    shutil.copy2(wav_path, out_wav_path)
-        else:
-            out_wav_path = wav_path
+    _write_manifest(out_dir)
+    _validate_output(out_dir)
 
-        lines.append(f"{spec.audio_type}|{out_wav_path}")
-
-    manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"[audio] manifest={manifest_path}")
-    for line in lines:
-        print(f"  {line}")
+    print(f"[audio] baseline assets refreshed under {out_dir}")
+    print(f"[audio] manifest={out_dir / 'manifest.txt'}")
+    for spec in SPECS:
+        print(f"  {spec.audio_type}|{spec.relative_wav}")
 
 
 if __name__ == "__main__":

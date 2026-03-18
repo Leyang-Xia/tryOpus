@@ -110,7 +110,7 @@ if (activity == VAD_NO_ACTIVITY && speech_activity_Q8 >= threshold)
 | **TTS 中文连续朗读** | 真实语音 | **91.2%** | **85.2%** |
 | **TTS 快速英文** | 真实语音 | **90.8%** | **84.0%** |
 | **TTS 英文连续朗读** | 真实语音 | **80.8%** | **67.6%** |
-| speech_like.wav（合成，0.5s 停顿） | 合成 | 14.6% | 14.6% |
+| 早期合成样本（0.5s 停顿） | 合成 | 14.6% | 14.6% |
 | speech_continuous.wav（合成，无停顿） | 合成 | 14.4% | — |
 | sine_440hz.wav | 参照 | 99.8% | — |
 | noise.wav | 参照 | 99.8% | — |
@@ -140,7 +140,7 @@ if (activity == VAD_NO_ACTIVITY && speech_activity_Q8 >= threshold)
 | 32 kbps | 10% | SWB 7% + FB 93% | 14.6% |
 | 48 kbps | 10% | FB 100% | 14.6% |
 
-（以上为 `speech_like.wav` 合成信号数据；真实语音在相同码率/plp 下生成率更高）
+（以上为早期合成信号数据；真实语音在相同码率/plp 下生成率更高）
 
 ### 3.4 LBRR 恢复质量
 
@@ -234,7 +234,7 @@ CBR 模式不增加（替换填充字节），VBR 模式增加约 20-40%。
 
 ## 6. 在本项目中的实现
 
-本项目 `opus_sim.c` 的 LBRR 恢复逻辑：
+本项目 `offline_validation/src/opus_sim.c` 的 LBRR 恢复逻辑：
 
 ```c
 // 仅恢复突发中最后一帧，从 next_ok 包中提取 LBRR
@@ -256,7 +256,7 @@ gcc -O2 -o build/analyze_lbrr tools/analyze_lbrr_rate.c \
     -I opus-install/include -L opus-install/lib -lopus -lm
 
 # 使用
-./build/analyze_lbrr audio/speech_like.wav 32000 10 0
+./build/analyze_lbrr representative_audio/dialogue/dialogue_30s_48k_mono.wav 32000 10 0
 ```
 
 ---

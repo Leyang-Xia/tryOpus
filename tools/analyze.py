@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-analyze.py - Opus仿真结果分析与可视化
+analyze.py - Opus仿真结果辅助分析
 
 功能:
   1. 解析仿真统计CSV文件，绘制丢包分布、恢复情况
-  2. 计算PESQ/STOI等客观指标（如果安装了pesq库）
-  3. 对比不同保护方案（PLC-only vs LBRR vs DRED）
+  2. 计算两段音频之间的 WER / SER
+  3. 辅助对比实验目录中的旧式结果
 
 用法:
-  python3 analyze.py --csv results/stats.csv
-  python3 analyze.py --ref audio/speech_like.wav --deg results/output.wav
-  python3 analyze.py --compare  # 批量对比实验
+  python3 analyze.py --csv results/offline_runs/manual/dred3_10.csv
+  python3 analyze.py --ref representative_audio/dialogue/dialogue_30s_48k_mono.wav --deg results/offline_runs/manual/dred3_10.wav
 """
 
 import sys
@@ -19,6 +18,11 @@ import argparse
 import struct
 import math
 import csv
+
+try:
+    from gen_rtc_report import _stt_metrics
+except ImportError:
+    _stt_metrics = None
 
 # ---- WAV读取 ----
 def read_wav(path: str):
@@ -244,35 +248,42 @@ def main():
     parser.add_argument('--ref',     help='参考WAV文件（原始音频）')
     parser.add_argument('--deg',     help='降质WAV文件（解码输出）')
     parser.add_argument('--compare', help='对比分析目录')
+    parser.add_argument('--stt-model', default=os.environ.get('RTC_STT_MODEL', 'small.en'),
+                        help='Whisper model name for transcript-based metrics')
+    parser.add_argument('--stt-language', default=os.environ.get('RTC_STT_LANGUAGE'),
+                        help='Optional forced language for Whisper transcription')
     args = parser.parse_args()
 
     if args.csv:
         analyze_csv(args.csv)
 
     if args.ref and args.deg:
-        print(f"\n===== 音质对比 =====")
+        print(f"\n===== 文本指标对比 (WER / SER) =====")
+        if _stt_metrics is None:
+            print("错误: 无法导入 transcript 评估逻辑，请使用仓库内置环境运行。")
+            return
         try:
-            ref_s, ref_sr, _ = read_wav(args.ref)
-            deg_s, _,      _ = read_wav(args.deg)
+            wer, ser, ref_text, hyp_text, _, _ = _stt_metrics(
+                args.ref,
+                args.deg,
+                "analysis",
+                "manual",
+                os.path.splitext(os.path.basename(args.deg))[0],
+                None,
+                args.stt_model,
+                args.stt_language,
+                {},
+            )
         except Exception as e:
             print(f"错误: {e}")
             return
 
-        snr     = compute_snr(ref_s, deg_s)
-        seg_snr = compute_segsnr(ref_s, deg_s, ref_sr)
-
         print(f"参考文件 : {args.ref}")
         print(f"测试文件 : {args.deg}")
-        print(f"全局SNR  : {snr:.2f} dB")
-        print(f"分段SNR  : {seg_snr:.2f} dB")
-        print(f"样本数   : ref={len(ref_s)}, deg={len(deg_s)}")
-
-        # 计算差异分布
-        n = min(len(ref_s), len(deg_s))
-        diffs = [abs(ref_s[i] - deg_s[i]) for i in range(n)]
-        avg_diff = sum(diffs) / n if n > 0 else 0
-        max_diff = max(diffs) if diffs else 0
-        print(f"平均绝对误差: {avg_diff:.1f} (最大: {max_diff})")
+        print(f"WER      : {wer:.2%}" if wer is not None else "WER      : -")
+        print(f"SER      : {ser:.2%}" if ser is not None else "SER      : -")
+        print(f"参考转写 : {ref_text or '-'}")
+        print(f"输出转写 : {hyp_text or '-'}")
 
     if args.compare:
         compare_experiment(args.compare)
