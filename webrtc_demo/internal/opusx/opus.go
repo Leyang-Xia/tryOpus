@@ -11,6 +11,9 @@ static int go_opus_encoder_set_bitrate(OpusEncoder *enc, int bitrate) {
 static int go_opus_encoder_set_complexity(OpusEncoder *enc, int complexity) {
 	return opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(complexity));
 }
+static int go_opus_encoder_set_signal(OpusEncoder *enc, int signal) {
+	return opus_encoder_ctl(enc, OPUS_SET_SIGNAL(signal));
+}
 static int go_opus_encoder_set_inband_fec(OpusEncoder *enc, int enable) {
 	return opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(enable));
 }
@@ -42,7 +45,10 @@ import (
 )
 
 const (
-	AppVoIP = int(C.OPUS_APPLICATION_VOIP)
+	AppVoIP     = int(C.OPUS_APPLICATION_VOIP)
+	SignalAuto  = int(C.OPUS_AUTO)
+	SignalVoice = int(C.OPUS_SIGNAL_VOICE)
+	SignalMusic = int(C.OPUS_SIGNAL_MUSIC)
 )
 
 func Version() string {
@@ -92,6 +98,10 @@ func (e *Encoder) SetBitrate(bitrate int) error {
 
 func (e *Encoder) SetComplexity(complexity int) error {
 	return opusError(C.go_opus_encoder_set_complexity(e.st, C.int(complexity)))
+}
+
+func (e *Encoder) SetSignal(signal int) error {
+	return opusError(C.go_opus_encoder_set_signal(e.st, C.int(signal)))
 }
 
 func (e *Encoder) SetInBandFEC(enable bool) error {

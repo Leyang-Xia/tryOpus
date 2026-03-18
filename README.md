@@ -342,7 +342,7 @@ EXPERIMENT_SUITE=full bash scripts/run_rtc_experiments.sh
 - `rtc_experiment_summary.csv` / `rtc_report.md`：本次实验汇总与报告
 
 为便于快速回归，代表性音频以仓库内置资产的形式保存在 `representative_audio/`；`results/rtc_latest` 始终指向最近一次 RTC 运行目录。
-离线与 RTC 两套报告默认都使用仓库下 `.venv_asr/bin/python` 中的 `faster-whisper`，默认模型为 `small.en`。`dialogue` 使用仓库内置参考文本，`news` 使用干净输入音频转写作为参考文本；若本地没有该模型缓存，脚本会自动回退到已缓存的 `base.en` 或 `tiny`，避免整轮实验在报告阶段失败。
+离线与 RTC 两套报告默认都使用仓库下 `.venv_asr/bin/python` 中的 ASR 环境，默认模型为 `small.en`。在 Apple Silicon macOS 上默认优先使用 `mlx-whisper`，其他环境默认使用 `faster-whisper`；也可以通过 `RTC_STT_BACKEND=mlx|faster|auto` 显式指定后端。`dialogue` 使用仓库内置参考文本，`news` 使用干净输入音频转写作为参考文本；若请求的模型在当前后端不可用，脚本会自动回退到可用后端或已缓存模型，避免整轮实验在报告阶段失败。
 
 RTC 实验默认直接复用仓库内置的两类 30 秒基线语音音频：
 
@@ -352,15 +352,6 @@ RTC 实验默认直接复用仓库内置的两类 30 秒基线语音音频：
 如果更关心回归速度而不是识别稳定性，可在运行前覆盖 `STT_MODEL=base.en`。
 
 默认标准集固定为 30 秒，以便 `SER` 在对话与新闻样本上有足够多的句子可比较。
-
-如果在 Cursor Cloud 中运行，建议在启动脚本执行：
-
-```bash
-bash scripts/cursor_cloud_startup.sh
-```
-
-该脚本会保证 Go `>=1.22`，并预热 `webrtc_demo` 的 Go 依赖。
-
 ---
 
 ## 依赖

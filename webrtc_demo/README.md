@@ -151,7 +151,7 @@ RTC 实验默认直接读取顶层 `representative_audio/manifest.txt` 中的两
 - `results/rtc_latest`：指向最新一次实验目录的符号链接
 
 代表性音频作为仓库内置资产保存在顶层 `representative_audio/`，RTC 实验会把它们复制到每次运行的 `inputs/` 目录。
-WER/SER 报告默认使用仓库下 `.venv_asr/bin/python` 中的 `faster-whisper`，默认模型为 `small.en`，并把干净输入音频的转写结果当作参考文本；若本地没有该模型缓存，脚本会自动回退到已缓存的 `base.en` 或 `tiny`，避免整轮实验在报告阶段失败。
+WER/SER 报告默认使用仓库下 `.venv_asr/bin/python` 中的 ASR 环境，默认模型为 `small.en`。在 Apple Silicon macOS 上默认优先使用 `mlx-whisper`，其他环境默认使用 `faster-whisper`；也可以通过 `RTC_STT_BACKEND=mlx|faster|auto` 显式指定后端。报告会把干净输入音频的转写结果当作参考文本；若请求的模型在当前后端不可用，脚本会自动回退到可用后端或已缓存模型，避免整轮实验在报告阶段失败。
 如果更关心回归速度而不是识别稳定性，可在运行前覆盖 `STT_MODEL=base.en`。
 
 ### 当前实现说明

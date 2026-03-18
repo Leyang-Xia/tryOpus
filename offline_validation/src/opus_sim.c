@@ -83,6 +83,7 @@ static void print_usage(const char *prog) {
         "  -vbr,--vbr                 开启VBR\n"
         "  -dred <n>                  DRED冗余帧数 (单位:10ms, 推荐2-10)\n"
         "  -cx, --complexity <0-10>   编码复杂度 (默认:9)\n"
+        "  --signal <auto|voice|music> 编码信号类型提示 (默认:auto)\n"
         "  -app <voip|audio|ll>       应用类型 (默认:voip)\n"
         "\n"
         "解码器选项:\n"
@@ -132,6 +133,7 @@ static int parse_args(int argc, char **argv, SimConfig *cfg) {
     cfg->enc_cfg.use_vbr          = 0;
     cfg->enc_cfg.dred_duration    = 0;
     cfg->enc_cfg.complexity       = 9;
+    cfg->enc_cfg.signal_type      = OPUS_AUTO;
     cfg->enc_cfg.lsb_depth        = 16;
 
     /* 解码器默认值 */
@@ -173,6 +175,15 @@ static int parse_args(int argc, char **argv, SimConfig *cfg) {
             cfg->enc_cfg.dred_duration = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "-cx") || !strcmp(argv[i], "--complexity")) {
             cfg->enc_cfg.complexity = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--signal")) {
+            const char *s = argv[++i];
+            if      (!strcmp(s, "auto"))  cfg->enc_cfg.signal_type = OPUS_AUTO;
+            else if (!strcmp(s, "voice")) cfg->enc_cfg.signal_type = OPUS_SIGNAL_VOICE;
+            else if (!strcmp(s, "music")) cfg->enc_cfg.signal_type = OPUS_SIGNAL_MUSIC;
+            else {
+                fprintf(stderr, "未知 signal 类型: %s\n", s);
+                return -1;
+            }
         } else if (!strcmp(argv[i], "-app")) {
             const char *a = argv[++i];
             if      (!strcmp(a, "voip"))  cfg->enc_cfg.application = OPUS_APPLICATION_VOIP;
@@ -254,6 +265,9 @@ int main(int argc, char **argv) {
     printf("DTX         : %s\n", cfg.enc_cfg.use_dtx ? "开" : "关");
     printf("VBR         : %s\n", cfg.enc_cfg.use_vbr ? "开" : "关");
     printf("复杂度      : %d\n", cfg.enc_cfg.complexity);
+    printf("Signal提示  : %s\n",
+           cfg.enc_cfg.signal_type == OPUS_SIGNAL_VOICE ? "voice" :
+           cfg.enc_cfg.signal_type == OPUS_SIGNAL_MUSIC ? "music" : "auto");
     netsim_print_params(&cfg.net_cfg);
 
     /* ---- 打开输入WAV ---- */
@@ -290,6 +304,7 @@ int main(int argc, char **argv) {
     opus_encoder_ctl(enc, OPUS_SET_DTX(cfg.enc_cfg.use_dtx));
     opus_encoder_ctl(enc, OPUS_SET_VBR(cfg.enc_cfg.use_vbr));
     opus_encoder_ctl(enc, OPUS_SET_LSB_DEPTH(cfg.enc_cfg.lsb_depth));
+    opus_encoder_ctl(enc, OPUS_SET_SIGNAL(cfg.enc_cfg.signal_type));
     if (cfg.enc_cfg.dred_duration > 0) {
         opus_encoder_ctl(enc, OPUS_SET_DRED_DURATION(
                                   cfg.enc_cfg.dred_duration));

@@ -22,6 +22,8 @@ BUILD_DIR="$ROOT_DIR/build"
 SIM="$BUILD_DIR/opus_sim"
 BITRATE="${BITRATE:-32000}"
 FRAMESIZE="${FRAMESIZE:-20}"
+COMPLEXITY="${COMPLEXITY:-9}"
+SIGNAL_HINT="${SIGNAL_HINT:-auto}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="${RUN_DIR:-$ROOT_DIR/results/offline_runs/$RUN_ID}"
 INPUT_DIR="$RUN_DIR/inputs"
@@ -97,6 +99,8 @@ run_sim() {
     "$SIM" \
         --bitrate "$BITRATE" \
         --framesize "$FRAMESIZE" \
+        --complexity "$COMPLEXITY" \
+        --signal "$SIGNAL_HINT" \
         --csv "$out_csv" \
         "$@" \
         "$input_wav" "$out_wav" \
@@ -136,6 +140,8 @@ echo " Opus 离线仿真实验套件"
 echo "========================================================"
 echo "码率     : ${BITRATE} bps"
 echo "帧长     : ${FRAMESIZE} ms"
+echo "复杂度   : ${COMPLEXITY}"
+echo "Signal   : ${SIGNAL_HINT}"
 echo "输入清单 : $REP_AUDIO_MANIFEST"
 echo "运行目录 : $RUN_DIR"
 echo ""
