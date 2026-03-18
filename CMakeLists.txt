@@ -10,21 +10,21 @@ set(OPUS_INCLUDE_DIR "${OPUS_INSTALL_DIR}/include")
 set(OPUS_LIB_DIR     "${OPUS_INSTALL_DIR}/lib")
 
 include_directories(
-    src
+    offline_validation/src
     ${OPUS_INCLUDE_DIR}
 )
 link_directories(${OPUS_LIB_DIR})
 
 # ---- opus_sim: 离线仿真工具 ----
-add_executable(opus_sim src/opus_sim.c)
+add_executable(opus_sim offline_validation/src/opus_sim.c)
 target_link_libraries(opus_sim opus m)
 
 # ---- opus_sender: UDP发送端 ----
-add_executable(opus_sender src/sender.c)
+add_executable(opus_sender offline_validation/src/sender.c)
 target_link_libraries(opus_sender opus m)
 
 # ---- opus_receiver: UDP接收端 ----
-add_executable(opus_receiver src/receiver.c)
+add_executable(opus_receiver offline_validation/src/receiver.c)
 target_link_libraries(opus_receiver opus m)
 
 # 编译后提示

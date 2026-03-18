@@ -1,0 +1,2 @@
+news|news/news_30s_48k_mono.wav
+dialogue|dialogue/dialogue_30s_48k_mono.wav

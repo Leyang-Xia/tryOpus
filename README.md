@@ -13,24 +13,18 @@
 .
 ├── opus-src/          # Opus 1.6.1 源码（含 DRED/OSCE/BWE 支持）
 ├── opus-install/      # 编译后的 Opus 库
-├── src/
-│   ├── common.h       # 公共类型定义（RTP、配置、统计）
-│   ├── wav_io.h       # WAV 文件读写
-│   ├── netsim.h       # 网络信道仿真（丢包/时延/抖动）
-│   ├── opus_sim.c     # ★ 核心：离线仿真工具
-│   ├── sender.c       # UDP 实时发送端
-│   └── receiver.c     # UDP 实时接收端（含抖动缓冲）
 ├── tools/
-│   ├── gen_audio.py                 # 生成合成测试音频（正弦波/语音/调频/噪声）
-│   ├── prepare_representative_audio.py  # 下载代表性真实音频（music/news/dialogue）
-│   ├── analyze.py                   # 分析仿真结果（SNR/SegSNR/丢包分布）
-│   └── gen_rtc_report.py            # 从实验 CSV 生成 Markdown 报告
-├── scripts/
-│   ├── run_experiments.sh  # 批量离线仿真实验脚本
-│   └── run_udp_test.sh     # UDP 回环测试脚本
-├── webrtc_demo/       # Pion WebRTC 轻量 Demo（含 RTC 实验矩阵）
-├── audio/             # 测试音频文件
-├── results/           # 仿真输出 + Markdown 报告
+│   ├── prepare_representative_audio.py  # 更新 30s 代表性基线音频（news/dialogue）
+│   ├── analyze.py                       # 辅助分析统计 CSV 与音频对比
+│   └── gen_rtc_report.py                # 从实验 CSV 生成 Markdown 报告
+├── offline_validation/ # 非 RTC 验证入口（离线仿真 + UDP 回环）
+│   ├── src/                            # 离线侧 C 源码（opus_sim / sender / receiver）
+│   ├── run_experiments.sh              # 批量离线仿真实验脚本
+│   ├── run_udp_test.sh                 # UDP 回环测试脚本
+│   └── README.md
+├── webrtc_demo/        # RTC 验证入口（Pion WebRTC 实验矩阵）
+├── representative_audio/ # 仓库内置 30s 基线测试音频
+├── results/            # 实验输出（offline_runs / rtc_runs + latest 入口）
 ├── weights_blob.bin   # DRED/DeepPLC 神经网络权重
 └── CMakeLists.txt
 ```
@@ -53,62 +47,68 @@ make -j$(nproc)
 cd ..
 ```
 
-### 2. 准备测试音频
+### 2. 准备标准测试音频
 
-**方式 A：合成音频（离线快速测试）**
+项目统一使用仓库内置的 30 秒基线音频：
 
-```bash
-python3 tools/gen_audio.py
-```
+- `representative_audio/news/news_30s_48k_mono.wav`
+- `representative_audio/dialogue/dialogue_30s_48k_mono.wav`
+- `representative_audio/dialogue/dialogue_reference.txt`
 
-生成的文件：
-- `audio/speech_like.wav` — 模拟语音（48kHz, 单声道, 10秒）
-- `audio/sine_440hz.wav` — 纯正弦波
-- `audio/chirp_200_4000.wav` — 线性调频信号（用于频响测试）
-- `audio/speech_16k.wav` — 16kHz 语音（适合 LBRR 测试）
-
-**方式 B：代表性真实音频（推荐，需联网 + ffmpeg）**
+如需刷新这套基线素材：
 
 ```bash
-python3 tools/prepare_representative_audio.py \
-    --out-dir audio --manifest audio/manifest.txt --clip-seconds 10
+python3 tools/prepare_representative_audio.py --force
 ```
 
-自动下载三类代表性音频并统一转码到 48kHz 单声道 WAV：
+这会更新：
 
-- `music`：音乐片段（SoundHelix）
-- `news`：新闻播报片段（BBC podcast RSS 自动解析）
-- `dialogue`：多人对话场景片段（餐厅会话环境音）
+- `news`：VOA Learning English 新闻播报片段（固定跳过片头音乐）
+- `dialogue`：ELLLO 真实英文对话片段（附参考文本）
 
-### 3. 运行仿真
+### 3. 项目结构
+
+- `representative_audio/`：仓库内置标准输入资产，离线实验与 RTC 实验共用
+- `offline_validation/`：离线验证入口，包含离线侧 C 源码、批量离线仿真和 UDP 回环测试
+- `webrtc_demo/`：RTC 验证入口，包含 Pion WebRTC 端到端实验矩阵
+- `results/`：所有实验输出，离线与 RTC 均按 run 归档
+
+### 4. 运行仿真
 
 ```bash
 export LD_LIBRARY_PATH=$(pwd)/opus-install/lib:$LD_LIBRARY_PATH
+mkdir -p results/offline_runs/manual
 
 # 基础测试：无丢包
-./build/opus_sim audio/speech_like.wav results/clean.wav
+./build/opus_sim representative_audio/dialogue/dialogue_30s_48k_mono.wav \
+    results/offline_runs/manual/clean.wav
 
 # 10% 均匀丢包 + PLC（基准）
 ./build/opus_sim -l 0.1 --no-lbrr --no-dred \
-    audio/speech_like.wav results/plc_10.wav --csv results/plc_10.csv
+    representative_audio/dialogue/dialogue_30s_48k_mono.wav \
+    results/offline_runs/manual/plc_10.wav \
+    --csv results/offline_runs/manual/plc_10.csv
 
 # 10% 丢包 + DRED 3帧（推荐配置）
 ./build/opus_sim -l 0.1 -dred 3 \
-    audio/speech_like.wav results/dred3_10.wav --csv results/dred3_10.csv
+    representative_audio/dialogue/dialogue_30s_48k_mono.wav \
+    results/offline_runs/manual/dred3_10.wav \
+    --csv results/offline_runs/manual/dred3_10.csv
 
 # 突发丢包（Gilbert-Elliott）+ DRED 5帧
 ./build/opus_sim -ge -ge-p2b 0.05 -ge-b2g 0.3 -ge-bloss 0.8 \
-    -dred 5 audio/speech_like.wav results/ge_dred5.wav
+    -dred 5 representative_audio/dialogue/dialogue_30s_48k_mono.wav \
+    results/offline_runs/manual/ge_dred5.wav
 
-# 批量实验（使用代表性真实音频，默认 music/news/dialogue）
-bash scripts/run_experiments.sh
-
-# 使用合成音频运行
-AUDIO_MODE=synthetic bash scripts/run_experiments.sh
+# 批量实验（固定使用 representative_audio/news + representative_audio/dialogue）
+bash offline_validation/run_experiments.sh
 ```
 
-批量实验脚本会自动下载 music/news/dialogue 三类音频，对每种音频执行完整实验矩阵，
-并在 `results/opus_report.md` 生成 Markdown 汇总报告。
+批量实验脚本会直接读取 `representative_audio/manifest.txt` 中的 `news/dialogue` 标准集，
+并在 `results/offline_runs/<RUN_ID>/` 归档完整产物，同时维护：
+
+- `results/offline_report.md`：最近一次离线实验报告
+- `results/offline_latest`：指向最近一次离线运行目录
 
 ---
 
@@ -235,17 +235,17 @@ LBRR 恢复率 → 36-45%（突发丢包，因仅恢复末尾帧）
 ./build/opus_receiver -p 5004 -t 15 results/udp_out.wav
 
 # 终端2：启动发送端（含10%丢包仿真 + DRED）
-./build/opus_sender -p 5004 -l 0.1 -dred 5 audio/speech_like.wav
+./build/opus_sender -p 5004 -l 0.1 -dred 5 representative_audio/dialogue/dialogue_30s_48k_mono.wav
 ```
 
 ### 使用脚本自动化
 
 ```bash
 # 软件仿真丢包（推荐）
-bash scripts/run_udp_test.sh --loss 0.1 --dred 5
+bash offline_validation/run_udp_test.sh --loss 0.1 --dred 5
 
 # 使用 Linux tc netem 添加真实网络损伤（需要 root）
-bash scripts/run_udp_test.sh --netem --loss 10 --delay 50 --jitter 20
+bash offline_validation/run_udp_test.sh --netem --loss 10 --delay 50 --jitter 20
 ```
 
 ---
@@ -254,13 +254,15 @@ bash scripts/run_udp_test.sh --netem --loss 10 --delay 50 --jitter 20
 
 ```bash
 # 分析 CSV 统计文件
-python3 tools/analyze.py --csv results/dred3_10.csv
+python3 tools/analyze.py --csv results/offline_runs/manual/dred3_10.csv
 
-# 比较原始音频与恢复后音频的 SNR
-python3 tools/analyze.py --ref audio/speech_like.wav --deg results/dred3_10.wav
+# 比较原始音频与恢复后音频的文本退化（WER/SER）
+python3 tools/analyze.py \
+    --ref representative_audio/dialogue/dialogue_30s_48k_mono.wav \
+    --deg results/offline_runs/manual/dred3_10.wav
 
-# 对比目录下所有方案（需要有 reference.wav）
-python3 tools/analyze.py --compare results/
+# 标准离线 / RTC 评估以 run 报告中的 WER/SER 为准
+cat results/offline_report.md
 ```
 
 ---
@@ -317,25 +319,39 @@ bash scripts/run_test.sh
 ```bash
 cd webrtc_demo
 
-# 标准实验矩阵（5 场景 × 5 策略 × 3 音频 = 75 组）
+# 标准实验矩阵（默认聚焦 news/dialogue，5 场景 × 4 策略 × 2 音频 = 40 组）
 bash scripts/run_rtc_experiments.sh
 
-# 快速回归（2 场景 × 4 策略 × 3 音频 = 24 组）
+# 快速回归（2 场景 × 3 策略 × 2 音频 = 12 组）
 EXPERIMENT_SUITE=quick bash scripts/run_rtc_experiments.sh
 
-# 完整矩阵（含延迟抖动，6 场景 × 5 策略 × 3 音频 = 90 组）
+# 完整矩阵（含延迟抖动，6 场景 × 4 策略 × 2 音频 = 48 组）
 EXPERIMENT_SUITE=full bash scripts/run_rtc_experiments.sh
 ```
 
 实验完成后自动生成 `results/rtc_report.md`，包含：
 - **恢复策略表**：各音频类型下各保护方案的 LBRR/DRED/PLC 恢复帧数与恢复率
-- **SNR/SegSNR 表**：全局信噪比与分段信噪比对比
+- **WER/SER 表**：用同一 ASR 后端比较干净输入与 RTC 输出的相对文本错误率
+- **音频/转写工件表**：输入 WAV、输出 WAV、参考转写、输出转写和统计 JSON
 
-默认实验会自动联网下载三类代表性音频并统一转码到 48kHz 单声道：
+每次 RTC 实验还会保留完整输入/输出音频与统计工件，默认目录为 `results/rtc_runs/<RUN_ID>/`：
+- `inputs/`：本次使用的 `news/dialogue` 输入 WAV
+- `outputs/`：每个场景与保护策略对应的接收端输出 WAV
+- `transcripts/`：参考转写与各 case 输出转写
+- `stats/`：每个 case 的统计 JSON
+- `rtc_experiment_summary.csv` / `rtc_report.md`：本次实验汇总与报告
 
-- `music`：音乐片段（SoundHelix）
-- `news`：新闻播报片段（BBC podcast RSS 自动解析）
-- `dialogue`：多人对话场景片段（餐厅会话环境音）
+为便于快速回归，代表性音频以仓库内置资产的形式保存在 `representative_audio/`；`results/rtc_latest` 始终指向最近一次 RTC 运行目录。
+离线与 RTC 两套报告默认都使用仓库下 `.venv_asr/bin/python` 中的 `faster-whisper`，默认模型为 `small.en`。`dialogue` 使用仓库内置参考文本，`news` 使用干净输入音频转写作为参考文本；若本地没有该模型缓存，脚本会自动回退到已缓存的 `base.en` 或 `tiny`，避免整轮实验在报告阶段失败。
+
+RTC 实验默认直接复用仓库内置的两类 30 秒基线语音音频：
+
+- `news`：VOA Learning English 新闻播报片段（固定跳过片头音乐）
+- `dialogue`：ELLLO 真实英文对话片段（附参考文本）
+
+如果更关心回归速度而不是识别稳定性，可在运行前覆盖 `STT_MODEL=base.en`。
+
+默认标准集固定为 30 秒，以便 `SER` 在对话与新闻样本上有足够多的句子可比较。
 
 如果在 Cursor Cloud 中运行，建议在启动脚本执行：
 

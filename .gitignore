@@ -7,8 +7,11 @@ build/
 results/*.wav
 results/*.csv
 results/*.log
-results/audio_cache/
-audio/*.wav
+results/offline_runs/
+results/offline_latest
+results/offline_report.md
+results/rtc_runs/
+results/rtc_bin_cache/
 
 # IDE
 .vscode/
@@ -19,6 +22,7 @@ audio/*.wav
 # Python
 __pycache__/
 *.pyc
+.venv_asr/
 
 # Opus src
 opus-src/
