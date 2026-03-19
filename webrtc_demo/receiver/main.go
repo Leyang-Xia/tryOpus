@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -32,47 +33,6 @@ type decodeStats struct {
 	DecodeErrors      int     `json:"decode_errors"`
 	OutputSamples     int     `json:"output_samples"`
 	RecoveryRate      float64 `json:"recovery_rate"`
-}
-
-type lossSimulator struct {
-	rng        *rand.Rand
-	uniform    float64
-	useGE      bool
-	pGoodToBad float64
-	pBadToGood float64
-	lossInBad  float64
-	inBad      bool
-}
-
-func newLossSimulator(seed int64, uniform float64, useGE bool, pGoodToBad float64, pBadToGood float64, lossInBad float64) *lossSimulator {
-	return &lossSimulator{
-		rng:        rand.New(rand.NewSource(seed)),
-		uniform:    uniform,
-		useGE:      useGE,
-		pGoodToBad: pGoodToBad,
-		pBadToGood: pBadToGood,
-		lossInBad:  lossInBad,
-	}
-}
-
-func (s *lossSimulator) shouldDrop() bool {
-	if s.useGE {
-		if s.inBad {
-			if s.rng.Float64() < s.pBadToGood {
-				s.inBad = false
-			}
-		} else if s.rng.Float64() < s.pGoodToBad {
-			s.inBad = true
-		}
-		if s.inBad {
-			return s.rng.Float64() < s.lossInBad
-		}
-		return false
-	}
-	if s.uniform <= 0 {
-		return false
-	}
-	return s.rng.Float64() < s.uniform
 }
 
 func seqGap(prev uint16, curr uint16) int {
@@ -147,7 +107,19 @@ func main() {
 		log.Fatalf("create/get session failed: %v", err)
 	}
 
-	pc, err := rtc.NewPeerConnection(webrtc.Configuration{})
+	var simDropCount atomic.Int64
+
+	pc, err := rtc.NewPeerConnection(webrtc.Configuration{}, rtc.WithReceiverLossSimulation(rtc.ReceiverLossConfig{
+		Uniform:    simLoss,
+		UseGE:      simGE,
+		PGoodToBad: simGEP2B,
+		PBadToGood: simGEB2G,
+		LossInBad:  simGELossBad,
+		Seed:       simSeed,
+		OnDrop: func() {
+			simDropCount.Add(1)
+		},
+	}))
 	if err != nil {
 		log.Fatalf("init peer connection failed: %v", err)
 	}
@@ -207,8 +179,8 @@ func main() {
 			}
 		}
 
-		sim := newLossSimulator(simSeed, simLoss, simGE, simGEP2B, simGEB2G, simGELossBad)
 		frameSize := 48000 * frameMS / 1000
+		jitterRNG := rand.New(rand.NewSource(simSeed + 1000003))
 
 		pcmBuf := make([]int16, frameSize*2)
 		pendingLost := make([]int, 0, 8)
@@ -278,7 +250,7 @@ func main() {
 		applyDecodeDelay := func() {
 			delay := simDelayMS
 			if simJitterMS > 0 {
-				delay += sim.rng.NormFloat64() * simJitterMS
+				delay += jitterRNG.NormFloat64() * simJitterMS
 			}
 			if delay > 0 {
 				time.Sleep(time.Duration(delay * float64(time.Millisecond)))
@@ -308,16 +280,6 @@ func main() {
 			}
 			prevSeq = pkt.SequenceNumber
 			hasPrevSeq = true
-
-			if sim.shouldDrop() {
-				pendingLost = append(pendingLost, pktIndex)
-				pktIndex++
-				statsMu.Lock()
-				stats.PacketsLost++
-				stats.PacketsSimDropped++
-				statsMu.Unlock()
-				continue
-			}
 
 			statsMu.Lock()
 			stats.PacketsReceived++
@@ -436,6 +398,10 @@ func main() {
 	}
 
 	statsMu.Lock()
+	stats.PacketsSimDropped = int(simDropCount.Load())
+	if stats.PacketsLost < stats.PacketsSimDropped {
+		stats.PacketsLost = stats.PacketsSimDropped
+	}
 	stats.OutputSamples = len(outSamples)
 	recoveredTotal := stats.RecoveredLBRR + stats.RecoveredDRED
 	if stats.PacketsLost > 0 {

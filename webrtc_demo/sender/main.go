@@ -4,11 +4,14 @@ import (
 	"flag"
 	"log"
 	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
+	"opus_lab/webrtc_demo/internal/adaptation"
 	"opus_lab/webrtc_demo/internal/opusx"
 	"opus_lab/webrtc_demo/internal/rtc"
 	"opus_lab/webrtc_demo/internal/signal"
@@ -17,20 +20,24 @@ import (
 
 func main() {
 	var (
-		signalURL    string
-		sessionID    string
-		inputWAV     string
-		frameMS      int
-		bitrate      int
-		packetLoss   int
-		enableFEC    bool
-		enableVBR    bool
-		complexity   int
-		signalHint   string
-		dredDuration int
-		dnnBlobPath  string
-		connectWait  time.Duration
-		signalWait   time.Duration
+		signalURL          string
+		sessionID          string
+		inputWAV           string
+		frameMS            int
+		bitrate            int
+		packetLoss         int
+		enableFEC          bool
+		enableVBR          bool
+		complexity         int
+		signalHint         string
+		dredDuration       int
+		dnnBlobPath        string
+		connectWait        time.Duration
+		signalWait         time.Duration
+		adaptiveRedundancy bool
+		feedbackInterval   time.Duration
+		adaptWindow        time.Duration
+		adaptLog           bool
 	)
 
 	flag.StringVar(&signalURL, "signal", "http://127.0.0.1:8090", "signaling server base URL")
@@ -47,6 +54,10 @@ func main() {
 	flag.StringVar(&dnnBlobPath, "weights", "../weights_blob.bin", "path to DNN blob file for DRED")
 	flag.DurationVar(&connectWait, "connect-timeout", 10*time.Second, "peer connection timeout")
 	flag.DurationVar(&signalWait, "signal-timeout", 20*time.Second, "answer wait timeout")
+	flag.BoolVar(&adaptiveRedundancy, "adaptive-redundancy", true, "adapt fec/dred redundancy from RTC feedback")
+	flag.DurationVar(&feedbackInterval, "feedback-interval", time.Second, "feedback polling interval")
+	flag.DurationVar(&adaptWindow, "adapt-window", 5*time.Second, "smoothing window duration")
+	flag.BoolVar(&adaptLog, "adapt-log", true, "log adaptive redundancy feedback and switches")
 	flag.Parse()
 
 	if sessionID == "" {
@@ -57,6 +68,12 @@ func main() {
 	}
 	if frameMS <= 0 {
 		log.Fatal("--frame-ms must be > 0")
+	}
+	if feedbackInterval <= 0 {
+		log.Fatal("--feedback-interval must be > 0")
+	}
+	if adaptWindow <= 0 {
+		log.Fatal("--adapt-window must be > 0")
 	}
 	if dredDuration > 0 && packetLoss == 0 {
 		packetLoss = 10
@@ -118,15 +135,6 @@ func main() {
 		log.Fatalf("add local track failed: %v", err)
 	}
 
-	go func() {
-		buf := make([]byte, 1500)
-		for {
-			if _, _, readErr := rtpSender.Read(buf); readErr != nil {
-				return
-			}
-		}
-	}()
-
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		log.Fatalf("create offer failed: %v", err)
@@ -168,6 +176,7 @@ func main() {
 		log.Fatalf("create opus encoder failed: %v", err)
 	}
 	defer encoder.Close()
+	var encMu sync.Mutex
 
 	if err := encoder.SetBitrate(bitrate); err != nil {
 		log.Fatalf("set encoder bitrate failed: %v", err)
@@ -200,18 +209,134 @@ func main() {
 	if err := encoder.SetPacketLossPerc(packetLoss); err != nil {
 		log.Fatalf("set packet loss percentage failed: %v", err)
 	}
+	var (
+		dredBlob     []byte
+		supportsDRED = true
+	)
+	if adaptiveRedundancy || dredDuration > 0 {
+		dredBlob, err = opusx.LoadDNNBlob(dnnBlobPath)
+		if err != nil {
+			log.Printf("warning: load dnn blob failed (%v), continue without adaptive DRED", err)
+			supportsDRED = false
+		}
+		if len(dredBlob) > 0 {
+			if err := encoder.SetDNNBlob(dredBlob); err != nil {
+				log.Printf("warning: set encoder dnn blob failed (%v), continue without adaptive DRED", err)
+				supportsDRED = false
+			}
+		}
+		if supportsDRED {
+			if err := encoder.SetDREDDuration(0); err != nil {
+				if opusx.IsRequestNotImplemented(err) {
+					log.Printf("warning: encoder DRED unsupported, adaptive loop will stay on LBRR-only: %v", err)
+					supportsDRED = false
+				} else {
+					log.Fatalf("probe dred support failed: %v", err)
+				}
+			}
+		}
+	}
 	if dredDuration > 0 {
 		if err := encoder.SetDREDDuration(dredDuration); err != nil {
 			log.Fatalf("set dred duration failed: %v", err)
 		}
-		blob, err := opusx.LoadDNNBlob(dnnBlobPath)
-		if err != nil {
-			log.Fatalf("load dnn blob failed: %v", err)
+		if len(dredBlob) == 0 {
+			dredBlob, err = opusx.LoadDNNBlob(dnnBlobPath)
+			if err != nil {
+				log.Fatalf("load dnn blob failed: %v", err)
+			}
 		}
-		if err := encoder.SetDNNBlob(blob); err != nil {
+		if err := encoder.SetDNNBlob(dredBlob); err != nil {
 			log.Printf("warning: set encoder dnn blob failed (%v), continue", err)
 		}
 		log.Printf("sender DRED enabled: duration=%d, blob=%s", dredDuration, dnnBlobPath)
+	}
+
+	if adaptiveRedundancy {
+		collector := adaptation.NewCollector()
+		controllerCfg := adaptation.DefaultControllerConfig()
+		controllerCfg.SupportsDRED = supportsDRED
+		controllerCfg.Cooling = 3 * time.Second
+		controllerCfg.PromoteConsecutive = maxInt(2, int((2*time.Second)/feedbackInterval))
+		controllerCfg.DemoteConsecutive = maxInt(5, int((adaptWindow)/feedbackInterval))
+		var (
+			controllerState adaptation.ControllerState
+			prevPacketsLost int32
+		)
+
+		go func() {
+			for {
+				pkts, _, rtcpErr := rtpSender.ReadRTCP()
+				if rtcpErr != nil {
+					if adaptLog {
+						log.Printf("adaptive rtcp reader stopped: %v", rtcpErr)
+					}
+					return
+				}
+				collector.ConsumeRTCP(pkts)
+				if adaptLog {
+					for _, pkt := range pkts {
+						switch p := pkt.(type) {
+						case *rtcp.ReceiverEstimatedMaximumBitrate:
+							log.Printf("adaptive rtcp remb=%.0fbps", p.Bitrate)
+						case *rtcp.TransportLayerCC:
+							log.Printf("adaptive rtcp twcc packets=%d fb=%d", p.PacketStatusCount, p.FbPktCount)
+						}
+					}
+				}
+			}
+		}()
+
+		go func() {
+			ticker := time.NewTicker(feedbackInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				snap := collector.Snapshot(pc.GetStats(), &prevPacketsLost)
+				decision, changed := adaptation.Observe(controllerCfg, &controllerState, snap)
+				if adaptLog {
+					log.Printf("adaptive snapshot loss=%.3f burst=%.3f jitter=%.3f rtt=%.3f remb=%.0f mode=%s reason=%s",
+						snap.FractionLost, snap.BurstLossRate, snap.JitterSeconds, snap.RTTSeconds, snap.REMBBps, decision.Mode, decision.Reason)
+				}
+				if !changed {
+					continue
+				}
+
+				encMu.Lock()
+				if err := encoder.SetInBandFEC(decision.FEC); err != nil {
+					encMu.Unlock()
+					log.Printf("adaptive set fec failed: %v", err)
+					continue
+				}
+				if err := encoder.SetPacketLossPerc(decision.PLP); err != nil {
+					encMu.Unlock()
+					log.Printf("adaptive set plp failed: %v", err)
+					continue
+				}
+				if controllerCfg.SupportsDRED {
+					if err := encoder.SetDREDDuration(decision.DRED); err != nil {
+						encMu.Unlock()
+						if opusx.IsRequestNotImplemented(err) {
+							controllerCfg.SupportsDRED = false
+							log.Printf("adaptive disabled dred after unsupported ctl: %v", err)
+							continue
+						}
+						log.Printf("adaptive set dred failed: %v", err)
+						continue
+					}
+				}
+				encMu.Unlock()
+				log.Printf("adaptive applied mode=%s fec=%v plp=%d dred=%d reason=%s",
+					decision.Mode, decision.FEC, decision.PLP, decision.DRED, decision.Reason)
+			}
+		}()
+	} else {
+		go func() {
+			for {
+				if _, _, readErr := rtpSender.ReadRTCP(); readErr != nil {
+					return
+				}
+			}
+		}()
 	}
 
 	samplesPerFrame := 48000 * frameMS / 1000
@@ -237,7 +362,9 @@ func main() {
 			stereoPCM[j*2+1] = sample
 		}
 
+		encMu.Lock()
 		n, encodeErr := encoder.Encode(stereoPCM, samplesPerFrame, packetBuf)
+		encMu.Unlock()
 		if encodeErr != nil {
 			log.Fatalf("encode opus frame=%d failed: %v", i, encodeErr)
 		}
@@ -252,4 +379,11 @@ func main() {
 
 	log.Printf("send complete: %d frames, input=%s", frameCount, inputWAV)
 	time.Sleep(500 * time.Millisecond)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

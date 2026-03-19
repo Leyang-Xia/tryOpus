@@ -19,11 +19,14 @@ INPUT_WAV="${TMP_DIR}/tone_48k_mono.wav"
 OUTPUT_WAV="${TMP_DIR}/received.wav"
 STATS_JSON="${TMP_DIR}/stats.json"
 OPUS_PKG_CONFIG="${OPUS_PKG_CONFIG:-${ROOT_DIR}/../opus-install/lib/pkgconfig}"
+PROJECT_OPUS_DYLIB="${PROJECT_OPUS_DYLIB:-${ROOT_DIR}/../opus-install/lib/libopus.0.dylib}"
 export PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}:${PKG_CONFIG_PATH:-}"
 export LD_LIBRARY_PATH="${ROOT_DIR}/../opus-install/lib:${LD_LIBRARY_PATH:-}"
+export DYLD_LIBRARY_PATH="${ROOT_DIR}/../opus-install/lib:${DYLD_LIBRARY_PATH:-}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${ROOT_DIR}/../weights_blob.bin}"
 SIM_LOSS="${SIM_LOSS:-0.10}"
 SIM_SEED="${SIM_SEED:-42}"
+BIN_DIR="${TMP_DIR}/bin"
 
 cleanup() {
   if [[ -n "${SIGNAL_PID:-}" ]]; then
@@ -35,9 +38,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
+verify_binary_libopus() {
+  local bin_path="$1"
+  local linked_path
+  local expected_path
+
+  expected_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PROJECT_OPUS_DYLIB}")"
+
+  linked_path="$(otool -L "${bin_path}" | awk '/libopus\.0\.dylib/ {print $1; exit}')"
+  if [[ -z "${linked_path}" ]]; then
+    echo "[test] ERROR: ${bin_path} is missing libopus dependency" >&2
+    exit 1
+  fi
+  linked_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${linked_path}")"
+  if [[ "${linked_path}" != "${expected_path}" ]]; then
+    echo "[test] ERROR: ${bin_path} linked unexpected libopus: ${linked_path}" >&2
+    echo "[test] expected project libopus: ${expected_path}" >&2
+    exit 1
+  fi
+}
+
 echo "[test] tmp dir: ${TMP_DIR}"
 echo "[test] using libopus pkg-config: ${OPUS_PKG_CONFIG}"
 echo "[test] using weights blob: ${WEIGHTS_PATH}"
+
+mkdir -p "${BIN_DIR}"
+(
+  cd "${ROOT_DIR}"
+  go clean -cache
+  PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}" go build -o "${BIN_DIR}/signaling" ./signaling
+  PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}" go build -o "${BIN_DIR}/receiver" ./receiver
+  PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}" go build -o "${BIN_DIR}/sender" ./sender
+)
+verify_binary_libopus "${BIN_DIR}/receiver"
+verify_binary_libopus "${BIN_DIR}/sender"
 
 (
   cd "${TMP_DIR}"
@@ -47,7 +81,7 @@ echo "[test] using weights blob: ${WEIGHTS_PATH}"
 echo "[test] starting signaling server on ${SIGNAL_URL}"
 (
   cd "${ROOT_DIR}"
-  go run ./signaling -addr ":${SIGNAL_PORT}" >"${TMP_DIR}/signaling.log" 2>&1
+  "${BIN_DIR}/signaling" -addr ":${SIGNAL_PORT}" >"${TMP_DIR}/signaling.log" 2>&1
 ) &
 SIGNAL_PID=$!
 sleep 1
@@ -55,7 +89,7 @@ sleep 1
 echo "[test] starting receiver session=${SESSION_ID}"
 (
   cd "${ROOT_DIR}"
-  go run ./receiver \
+  "${BIN_DIR}/receiver" \
     --signal "${SIGNAL_URL}" \
     --session "${SESSION_ID}" \
     --output "${OUTPUT_WAV}" \
@@ -73,7 +107,7 @@ sleep 1
 echo "[test] starting sender"
 (
   cd "${ROOT_DIR}"
-  go run ./sender \
+  "${BIN_DIR}/sender" \
     --signal "${SIGNAL_URL}" \
     --session "${SESSION_ID}" \
     --input "${INPUT_WAV}" \

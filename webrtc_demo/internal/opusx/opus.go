@@ -41,6 +41,7 @@ import "C"
 
 import (
 	"fmt"
+	"strings"
 	"unsafe"
 )
 
@@ -60,6 +61,10 @@ func opusError(code C.int) error {
 		return nil
 	}
 	return fmt.Errorf("opus error(%d): %s", int(code), C.GoString(C.opus_strerror(code)))
+}
+
+func IsRequestNotImplemented(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "request not implemented")
 }
 
 type Encoder struct {

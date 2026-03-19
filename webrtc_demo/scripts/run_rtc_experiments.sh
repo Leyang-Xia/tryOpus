@@ -28,6 +28,11 @@ set -euo pipefail
 #   ASR_PYTHON        用于生成 WER/SER 报告的 Python (默认 .venv_asr/bin/python, 否则 python3)
 #   STT_MODEL         Whisper 模型名 (默认 small.en)
 #   RTC_STT_BACKEND   ASR 后端: mlx|faster|auto (默认 Apple Silicon 上为 mlx)
+#   SENDER_ADAPTIVE_REDUNDANCY true|false (默认 true)
+#   SENDER_FEEDBACK_INTERVAL   自适应采样周期 (默认 1s)
+#   SENDER_ADAPT_WINDOW        自适应平滑窗口 (默认 5s)
+#   STRATEGY_FILTER            逗号分隔的策略名过滤，如 baseline,dred_5
+#   SCENARIO_FILTER            逗号分隔的场景名过滤，如 uniform_10,ge_moderate
 # ==========================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,6 +51,7 @@ fi
 SIGNAL_URL="http://127.0.0.1:${SIGNAL_PORT}"
 
 OPUS_PKG_CONFIG="${OPUS_PKG_CONFIG:-${WORKSPACE_DIR}/opus-install/lib/pkgconfig}"
+PROJECT_OPUS_DYLIB="${PROJECT_OPUS_DYLIB:-${WORKSPACE_DIR}/opus-install/lib/libopus.0.dylib}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${WORKSPACE_DIR}/weights_blob.bin}"
 SIM_SEED="${SIM_SEED:-42}"
 REP_AUDIO_DIR="${REP_AUDIO_DIR:-${WORKSPACE_DIR}/representative_audio}"
@@ -69,6 +75,11 @@ ASR_PYTHON="${ASR_PYTHON:-${WORKSPACE_DIR}/.venv_asr/bin/python}"
 STT_MODEL="${STT_MODEL:-small.en}"
 SENDER_COMPLEXITY="${SENDER_COMPLEXITY:-9}"
 SENDER_SIGNAL="${SENDER_SIGNAL:-auto}"
+SENDER_ADAPTIVE_REDUNDANCY="${SENDER_ADAPTIVE_REDUNDANCY:-true}"
+SENDER_FEEDBACK_INTERVAL="${SENDER_FEEDBACK_INTERVAL:-1s}"
+SENDER_ADAPT_WINDOW="${SENDER_ADAPT_WINDOW:-5s}"
+STRATEGY_FILTER="${STRATEGY_FILTER:-}"
+SCENARIO_FILTER="${SCENARIO_FILTER:-}"
 EXPERIMENT_SUITE="${EXPERIMENT_SUITE:-standard}"
 
 if [[ ! -x "${ASR_PYTHON}" ]]; then
@@ -92,13 +103,54 @@ build_binaries() {
   echo "[exp] building rtc binaries into ${BIN_DIR}"
   (
     cd "${ROOT_DIR}"
-    go build -o "${BIN_DIR}/signaling" ./signaling
-    go build -o "${BIN_DIR}/receiver" ./receiver
-    go build -o "${BIN_DIR}/sender" ./sender
+    go clean -cache
+    PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}" go build -o "${BIN_DIR}/signaling" ./signaling
+    PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}" go build -o "${BIN_DIR}/receiver" ./receiver
+    PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}" go build -o "${BIN_DIR}/sender" ./sender
   )
+
+  verify_binary_libopus "${BIN_DIR}/receiver"
+  verify_binary_libopus "${BIN_DIR}/sender"
+}
+
+verify_binary_libopus() {
+  local bin_path="$1"
+  local linked_path
+  local expected_path
+
+  expected_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PROJECT_OPUS_DYLIB}")"
+
+  linked_path="$(otool -L "${bin_path}" | awk '/libopus\.0\.dylib/ {print $1; exit}')"
+  if [[ -z "${linked_path}" ]]; then
+    echo "[exp] ${bin_path} is missing libopus dependency" >&2
+    exit 1
+  fi
+  linked_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${linked_path}")"
+  if [[ "${linked_path}" != "${expected_path}" ]]; then
+    echo "[exp] ${bin_path} linked unexpected libopus: ${linked_path}" >&2
+    echo "[exp] expected project libopus: ${expected_path}" >&2
+    exit 1
+  fi
 }
 
 build_binaries
+
+matches_filter() {
+  local name="$1"
+  local filter_csv="$2"
+  local item
+
+  if [[ -z "${filter_csv}" ]]; then
+    return 0
+  fi
+  IFS=',' read -r -a _filters <<< "${filter_csv}"
+  for item in "${_filters[@]}"; do
+    if [[ "${name}" == "${item}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
 
 # ---- 检查代表性音频 ----
 if [[ ! -f "${REP_AUDIO_MANIFEST}" ]]; then
@@ -183,6 +235,9 @@ run_case() {
       --input "${input_wav}" \
       --complexity "${SENDER_COMPLEXITY}" \
       --signal-hint "${SENDER_SIGNAL}" \
+      --adaptive-redundancy="${SENDER_ADAPTIVE_REDUNDANCY}" \
+      --feedback-interval "${SENDER_FEEDBACK_INTERVAL}" \
+      --adapt-window "${SENDER_ADAPT_WINDOW}" \
       --weights "${WEIGHTS_PATH}" ${sender_extra} \
       >"${LOG_DIR}/${audio_type}_${scenario_name}_${case_name}_sender.log" 2>&1
   )
@@ -223,12 +278,15 @@ PY
 # ================================================================
 declare -a STRATEGIES_QUICK=(
   "baseline|--fec=false --dred=0 --plp=0|--use-lbrr=false --use-dred=false"
+  "adaptive_auto|--fec=false --dred=0 --plp=0|--use-lbrr=true --use-dred=true"
   "lbrr_only|--fec=true --dred=0 --plp=15|--use-lbrr=true --use-dred=false"
   "dred_3|--fec=false --dred=3 --plp=15|--use-lbrr=false --use-dred=true"
+  "dred_5|--fec=false --dred=5 --plp=15|--use-lbrr=false --use-dred=true"
 )
 
 declare -a STRATEGIES_FULL=(
   "baseline|--fec=false --dred=0 --plp=0|--use-lbrr=false --use-dred=false"
+  "adaptive_auto|--fec=false --dred=0 --plp=0|--use-lbrr=true --use-dred=true"
   "lbrr_only|--fec=true --dred=0 --plp=15|--use-lbrr=true --use-dred=false"
   "dred_3|--fec=false --dred=3 --plp=15|--use-lbrr=false --use-dred=true"
   "dred_5|--fec=false --dred=5 --plp=15|--use-lbrr=false --use-dred=true"
@@ -281,6 +339,28 @@ case "${EXPERIMENT_SUITE}" in
     ;;
 esac
 
+if [[ -n "${SCENARIO_FILTER}" ]]; then
+  filtered_scenarios=()
+  for scenario_def in "${SCENARIOS[@]}"; do
+    IFS='|' read -r scenario_name _ <<< "${scenario_def}"
+    if matches_filter "${scenario_name}" "${SCENARIO_FILTER}"; then
+      filtered_scenarios+=("${scenario_def}")
+    fi
+  done
+  SCENARIOS=("${filtered_scenarios[@]}")
+fi
+
+if [[ -n "${STRATEGY_FILTER}" ]]; then
+  filtered_strategies=()
+  for strategy_def in "${STRATEGIES[@]}"; do
+    IFS='|' read -r case_name _ <<< "${strategy_def}"
+    if matches_filter "${case_name}" "${STRATEGY_FILTER}"; then
+      filtered_strategies+=("${strategy_def}")
+    fi
+  done
+  STRATEGIES=("${filtered_strategies[@]}")
+fi
+
 # ---- 打印实验矩阵 ----
 n_audio=$(wc -l < "${AUDIO_MANIFEST}")
 n_scenarios=${#SCENARIOS[@]}
@@ -300,6 +380,9 @@ echo " 总实验数   : ${total}"
 echo " 接收时长   : ${RECV_DURATION}"
 echo " 编码复杂度 : ${SENDER_COMPLEXITY}"
 echo " Signal提示 : ${SENDER_SIGNAL}"
+echo " 自适应冗余 : ${SENDER_ADAPTIVE_REDUNDANCY}"
+echo " 反馈周期   : ${SENDER_FEEDBACK_INTERVAL}"
+echo " 平滑窗口   : ${SENDER_ADAPT_WINDOW}"
 echo " 二进制缓存 : ${BIN_DIR}"
 echo " 报告输出   : ${REPORT_MD}"
 echo "========================================================"

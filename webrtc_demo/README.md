@@ -23,6 +23,12 @@ export PKG_CONFIG_PATH=${ROOT_DIR}/../opus-install/lib/pkgconfig:${PKG_CONFIG_PA
 export LD_LIBRARY_PATH=${ROOT_DIR}/../opus-install/lib:${LD_LIBRARY_PATH}
 ```
 
+在 macOS 上，`go build` / `go run` 可能因为 cgo build cache 复用而错误链接到 Homebrew 的 `libopus`。当前 `scripts/run_test.sh` 和 `scripts/run_rtc_experiments.sh` 已经内置：
+
+- `go clean -cache`
+- 用项目内 `opus-install/lib/pkgconfig` 重建
+- 用 `otool -L` 校验 sender/receiver 必须链接到项目内 `libopus.0.dylib`
+
 `sender` / `receiver` 会通过 `internal/opusx` 直接调用本地 `libopus`，并支持：
 
 - `OPUS_SET_DRED_DURATION`
