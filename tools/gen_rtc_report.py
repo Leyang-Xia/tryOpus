@@ -3,7 +3,7 @@
 gen_rtc_report.py - 从实验汇总 CSV 生成 Markdown 报告
 
 输入: webrtc_demo/scripts/run_rtc_experiments.sh 或 offline_validation/run_experiments.sh 产生的汇总 CSV
-输出: 对应 run 目录下的 Markdown 报告（RTC / 离线统一使用 WER/SER）
+输出: 对应 run 目录下的 Markdown 报告（RTC / 离线统一使用 WER）
 
 CSV 列（RTC）:
   audio_type,scenario,case,sim_mode,sim_loss,
@@ -18,6 +18,7 @@ CSV 列（离线仿真）:
 
 import argparse
 import csv
+import json
 import math
 import os
 import re
@@ -33,10 +34,7 @@ except ImportError:
     WhisperModel = None
     jiwer_wer = None
 
-try:
-    import mlx_whisper
-except ImportError:
-    mlx_whisper = None
+mlx_whisper = None
 
 
 # --------------- WAV 读取 ---------------
@@ -122,6 +120,7 @@ SCENARIO_LABELS = {
 CASE_LABELS = {
     "baseline": "无保护 (PLC)",
     "baseline_no_protection": "无保护 (PLC)",
+    "adaptive_auto": "自适应",
     "lbrr_only": "LBRR",
     "dred_3": "DRED-3",
     "dred_5": "DRED-5",
@@ -181,15 +180,50 @@ def _split_sentences(text: str) -> List[str]:
     return [sentence for sentence in sentences if sentence]
 
 
-def _split_reference_units(text: str) -> List[str]:
+def _split_text_units(text: str) -> List[str]:
     if not text:
         return []
     if "\n" in text:
-        lines = [_normalize_transcript(line) for line in text.splitlines()]
-        lines = [line for line in lines if line]
-        if lines:
-            return lines
+        units: List[str] = []
+        for line in text.splitlines():
+            units.extend(_split_sentences(line))
+        if units:
+            return units
     return _split_sentences(text)
+
+
+def _count_words(text: str) -> int:
+    norm = _normalize_transcript(text)
+    if not norm:
+        return 0
+    return len(norm.split())
+
+
+def _detect_repeated_ngram(text: str) -> Optional[str]:
+    tokens = _normalize_transcript(text).split()
+    if len(tokens) < 12:
+        return None
+    for n in (8, 6, 4):
+        if len(tokens) < n * 3:
+            continue
+        for i in range(0, len(tokens) - n * 3 + 1):
+            gram = tokens[i : i + n]
+            repeats = 1
+            j = i + n
+            while j + n <= len(tokens) and tokens[j : j + n] == gram:
+                repeats += 1
+                j += n
+            if repeats >= 3:
+                return f"repeated {n}-gram x{repeats}"
+    return None
+
+
+def _detect_asr_instability(ref_text: str, hyp_text: str) -> Optional[str]:
+    ref_words = _count_words(ref_text)
+    hyp_words = _count_words(hyp_text)
+    if ref_words > 0 and hyp_words > max(int(ref_words * 1.6), ref_words + 20):
+        return f"word_count {hyp_words}>{ref_words}"
+    return _detect_repeated_ngram(hyp_text)
 
 
 def _edit_distance(ref_units: List[str], hyp_units: List[str]) -> int:
@@ -298,7 +332,15 @@ def _load_whisper_model(model_name: str):
 
 
 def _mlx_available() -> bool:
-    return mlx_whisper is not None
+    global mlx_whisper
+    if mlx_whisper is not None:
+        return True
+    try:
+        import mlx_whisper as imported_mlx_whisper
+    except ImportError:
+        return False
+    mlx_whisper = imported_mlx_whisper
+    return True
 
 
 def _transcribe_audio_segments_mlx(
@@ -395,15 +437,15 @@ def _stt_metrics(
     model_name: str,
     language: Optional[str],
     transcript_cache: dict,
-) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str], Optional[str], Optional[str]]:
+) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[str], Optional[str], bool, str]:
     if jiwer_wer is None:
         raise RuntimeError(
             "jiwer is not installed; use the repo .venv_asr Python or install the ASR dependencies."
         )
     if not input_wav or not output_wav:
-        return None, None, None, None, None, None
+        return None, None, None, None, None, False, ""
     if not os.path.isfile(input_wav) or not os.path.isfile(output_wav):
-        return None, None, None, None, None, None
+        return None, None, None, None, None, False, ""
 
     ref_text = transcript_cache.get(input_wav)
     if ref_text is None:
@@ -412,25 +454,14 @@ def _stt_metrics(
             ref_text, _ = _transcribe_audio_segments(input_wav, model_name, language)
         transcript_cache[input_wav] = ref_text
 
-    hyp_text, hyp_segments = _transcribe_audio_segments(output_wav, model_name, language)
+    hyp_text, _ = _transcribe_audio_segments(output_wav, model_name, language)
     if not ref_text:
-        return None, None, ref_text, hyp_text, None, None
+        return None, ref_text, hyp_text, None, None, False, ""
 
     ref_text_norm = _normalize_transcript(ref_text)
     hyp_text_norm = _normalize_transcript(hyp_text)
     wer_value = jiwer_wer(ref_text_norm, hyp_text_norm)
-
-    ref_sentences = _split_reference_units(ref_text)
-    if not ref_sentences and ref_text_norm:
-        ref_sentences = [ref_text_norm]
-    hyp_sentences = hyp_segments or _split_sentences(hyp_text)
-    if not hyp_sentences and hyp_text_norm:
-        hyp_sentences = [hyp_text_norm]
-    if ref_sentences:
-        sentence_errors = min(_edit_distance(ref_sentences, hyp_sentences), len(ref_sentences))
-        ser_value = sentence_errors / len(ref_sentences)
-    else:
-        ser_value = 0.0 if ref_text_norm == hyp_text_norm else 1.0
+    instability_reason = _detect_asr_instability(ref_text, hyp_text) or ""
 
     ref_path = None
     hyp_path = None
@@ -439,7 +470,118 @@ def _stt_metrics(
         hyp_path = os.path.join(transcript_dir, audio_type, scenario, f"{case}.txt")
         _write_text(ref_path, ref_text)
         _write_text(hyp_path, hyp_text)
-    return wer_value, ser_value, ref_text, hyp_text, ref_path, hyp_path
+    return wer_value, ref_text, hyp_text, ref_path, hyp_path, bool(instability_reason), instability_reason
+
+
+def _load_adaptation_summary(path: str) -> dict:
+    summary = {
+        "switch_count": 0,
+        "first_dred_seconds": None,
+        "dred_duration_seconds": 0.0,
+        "bitrate_bps": 0,
+        "bitrate_tier": "-",
+        "decision_class": "-",
+        "dred_allowed": False,
+        "dred_level_cap": "-",
+        "entered_dred": False,
+    }
+    if not path or not os.path.isfile(path):
+        return summary
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            trace = json.load(f)
+    except Exception:
+        return summary
+
+    samples = trace.get("samples") or []
+    if not samples:
+        return summary
+
+    first_sample = samples[0]
+    summary["bitrate_bps"] = int(first_sample.get("bitrate_bps") or 0)
+    summary["bitrate_tier"] = first_sample.get("bitrate_tier") or "-"
+    summary["dred_level_cap"] = first_sample.get("dred_level_cap") or "-"
+    summary["dred_allowed"] = any(bool(sample.get("dred_allowed")) for sample in samples)
+    for sample in reversed(samples):
+        decision_class = sample.get("decision_class") or ""
+        if decision_class:
+            summary["decision_class"] = decision_class
+            break
+
+    parsed = []
+    for sample in samples:
+        timestamp = sample.get("timestamp")
+        mode = sample.get("mode", "")
+        if not timestamp:
+            continue
+        try:
+            ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        parsed.append((ts, mode))
+
+    if not parsed:
+        return summary
+
+    start_ts = parsed[0][0]
+    prev_mode = parsed[0][1]
+    if prev_mode.startswith("dred_"):
+        summary["first_dred_seconds"] = 0.0
+        summary["entered_dred"] = True
+
+    for idx in range(1, len(parsed)):
+        ts, mode = parsed[idx]
+        prev_ts, _ = parsed[idx - 1]
+        interval = max(0.0, (ts - prev_ts).total_seconds())
+        if prev_mode.startswith("dred_"):
+            summary["dred_duration_seconds"] += interval
+        if mode != prev_mode:
+            summary["switch_count"] += 1
+        if summary["first_dred_seconds"] is None and mode.startswith("dred_"):
+            summary["first_dred_seconds"] = max(0.0, (ts - start_ts).total_seconds())
+            summary["entered_dred"] = True
+        prev_mode = mode
+    return summary
+
+
+def _load_sender_stats(path: str) -> dict:
+    summary = {
+        "bytes_sent": 0,
+        "packets_sent": 0,
+        "avg_payload_bytes": 0.0,
+        "effective_payload_kbps": 0.0,
+    }
+    if not path or not os.path.isfile(path):
+        return summary
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            stats = json.load(f)
+    except Exception:
+        return summary
+
+    summary["bytes_sent"] = int(stats.get("bytes_sent") or 0)
+    summary["packets_sent"] = int(stats.get("packets_sent") or 0)
+    if summary["packets_sent"] > 0:
+        summary["avg_payload_bytes"] = summary["bytes_sent"] / summary["packets_sent"]
+    summary["effective_payload_kbps"] = float(stats.get("effective_payload_kbps") or 0.0)
+    return summary
+
+
+def _group_best_wer(rows: List[dict], keys: Tuple[str, ...]) -> dict:
+    best: dict = {}
+    for row in rows:
+        wer_text = row.get("wer", "")
+        if not wer_text or wer_text == "-":
+            continue
+        try:
+            wer_value = float(wer_text.rstrip("%"))
+        except ValueError:
+            continue
+        group = tuple(row.get(key, "") for key in keys)
+        current = best.get(group)
+        if current is None or wer_value < current:
+            best[group] = wer_value
+    return best
 
 
 def generate_rtc_report(
@@ -466,7 +608,7 @@ def generate_rtc_report(
         output_wav = row.get("output_wav", "")
         scenario = row.get("scenario", "")
         case = row.get("case", "")
-        wer_value, ser_value, ref_text, hyp_text, ref_path, hyp_path = _stt_metrics(
+        wer_value, ref_text, hyp_text, ref_path, hyp_path, asr_unstable, instability_reason = _stt_metrics(
             input_wav,
             output_wav,
             row.get("audio_type", ""),
@@ -478,11 +620,37 @@ def generate_rtc_report(
             transcript_cache,
         )
         row["wer"] = f"{wer_value:.2%}" if wer_value is not None else "-"
-        row["ser"] = f"{ser_value:.2%}" if ser_value is not None else "-"
         row["reference_text"] = ref_text or ""
         row["hypothesis_text"] = hyp_text or ""
         row["reference_text_path"] = ref_path or ""
         row["hypothesis_text_path"] = hyp_path or ""
+        row["asr_unstable"] = "yes" if asr_unstable else "no"
+        row["asr_unstable_reason"] = instability_reason
+        adaptation_summary = _load_adaptation_summary(row.get("adaptation_json", ""))
+        row["adapt_switch_count"] = str(adaptation_summary["switch_count"])
+        first_dred = adaptation_summary["first_dred_seconds"]
+        row["adapt_first_dred_seconds"] = "-" if first_dred is None else f"{first_dred:.1f}s"
+        row["adapt_dred_duration_seconds"] = f"{adaptation_summary['dred_duration_seconds']:.1f}s"
+        row["adapt_bitrate_bps"] = str(adaptation_summary["bitrate_bps"] or "-")
+        row["adapt_bitrate_tier"] = adaptation_summary["bitrate_tier"]
+        row["adapt_decision_class"] = adaptation_summary["decision_class"]
+        row["adapt_dred_allowed"] = "yes" if adaptation_summary["dred_allowed"] else "no"
+        row["adapt_dred_level_cap"] = adaptation_summary["dred_level_cap"]
+        row["adapt_entered_dred"] = "yes" if adaptation_summary["entered_dred"] else "no"
+        recovered_dred = int(row.get("recovered_dred", "0") or 0)
+        if adaptation_summary["entered_dred"] and recovered_dred == 0:
+            row["adapt_dred_effectiveness"] = "entered_dred_but_zero_recovery"
+        elif recovered_dred > 0:
+            row["adapt_dred_effectiveness"] = "effective"
+        elif adaptation_summary["entered_dred"]:
+            row["adapt_dred_effectiveness"] = "entered_dred"
+        else:
+            row["adapt_dred_effectiveness"] = "not_entered"
+        sender_stats = _load_sender_stats(row.get("sender_stats_json", ""))
+        row["tx_bytes"] = str(sender_stats["bytes_sent"])
+        row["tx_packets_sent"] = str(sender_stats["packets_sent"])
+        row["tx_avg_payload_bytes"] = f"{sender_stats['avg_payload_bytes']:.1f}" if sender_stats["packets_sent"] > 0 else "-"
+        row["tx_effective_payload_kbps"] = f"{sender_stats['effective_payload_kbps']:.2f}" if sender_stats["effective_payload_kbps"] > 0 else "-"
 
     audio_types = []
     seen = set()
@@ -499,6 +667,8 @@ def generate_rtc_report(
         if s not in seen_s:
             scenarios.append(s)
             seen_s.add(s)
+    best_rtc_wer = _group_best_wer(rows, ("audio_type", "scenario"))
+    has_adaptive_rows = any(r.get("case", r.get("name", "")) == "adaptive_auto" for r in rows)
 
     lines: List[str] = []
     lines.append("# RTC 传输实验报告\n")
@@ -522,9 +692,12 @@ def generate_rtc_report(
     lines.append("")
     lines.append("### 文本指标说明\n")
     lines.append(f"- 当前报告 ASR 后端/模型：`{_resolved_asr_summary(stt_model)}`。")
-    lines.append("- WER / SER 使用同一个 ASR 后端分别转写干净输入音频与 RTC 输出音频。")
+    lines.append("- `WER` 是主评估指标。")
+    lines.append("- WER 使用同一个 ASR 后端分别转写干净输入音频与 RTC 输出音频。")
     lines.append("- 干净输入音频的转写结果作为参考文本，因此这里衡量的是相对可懂度退化，而不是人工标注基准上的绝对识别率。")
-    lines.append("- SER 只有在音频中包含足够多、边界清晰的句子时才更有解释力，因此默认代表性语音片段已提升到 30 秒。")
+    lines.append("- `ASR unstable` 表示输出文本出现明显插入膨胀或重复 n-gram 循环，这类 case 的 WER 仍保留，但应结合原始 transcript 复核。")
+    lines.append("- `发送载荷字节` 基于 sender `sender_stats.json`，表示实验期间 sender 实际写出的 Opus payload 总字节数。")
+    lines.append("- `平均载荷/包` 与 `有效载荷码率(kbps)` 也都来自 sender 侧统计。")
     lines.append("")
 
     # ---- 恢复策略表 ----
@@ -553,9 +726,63 @@ def generate_rtc_report(
             )
         lines.append("")
 
-    # ---- WER / SER 表 ----
-    lines.append("## 文本指标 (WER / SER)\n")
-    lines.append("| 音频类型 | 丢包场景 | 保护策略 | WER | SER |")
+    if has_adaptive_rows:
+        lines.append("## 控制轨迹摘要\n")
+        lines.append("| 音频类型 | 丢包场景 | 保护策略 | 码率 | 档位 | 首次进入DRED | DRED持续时长 | 模式切换次数 |")
+        lines.append("|---------|---------|---------|-----|-----|-------------|-------------|-------------|")
+        for r in rows:
+            at = r.get("audio_type", "")
+            scenario = r.get("scenario", r.get("experiment", ""))
+            case = r.get("case", r.get("name", ""))
+            at_label = AUDIO_LABELS.get(at, at)
+            s_label = SCENARIO_LABELS.get(scenario, scenario)
+            c_label = CASE_LABELS.get(case, case)
+            lines.append(
+                f"| {at_label} | {s_label} | {c_label} | {r.get('adapt_bitrate_bps', '-')} | {r.get('adapt_bitrate_tier', '-')} | {r.get('adapt_first_dred_seconds', '-')} | "
+                f"{r.get('adapt_dred_duration_seconds', '0.0s')} | {r.get('adapt_switch_count', '0')} |"
+            )
+        lines.append("")
+
+        lines.append("## 低码率 DRED 有效性摘要\n")
+        lines.append("| 音频类型 | 丢包场景 | 保护策略 | 决策类别 | DRED允许 | DRED上限 | 首次进入DRED | DRED恢复 | 状态 |")
+        lines.append("|---------|---------|---------|---------|---------|---------|-------------|---------|------|")
+        for r in rows:
+            at = r.get("audio_type", "")
+            scenario = r.get("scenario", r.get("experiment", ""))
+            case = r.get("case", r.get("name", ""))
+            at_label = AUDIO_LABELS.get(at, at)
+            s_label = SCENARIO_LABELS.get(scenario, scenario)
+            c_label = CASE_LABELS.get(case, case)
+            lines.append(
+                f"| {at_label} | {s_label} | {c_label} | {r.get('adapt_decision_class', '-')} | "
+                f"{r.get('adapt_dred_allowed', 'no')} | {r.get('adapt_dred_level_cap', '-')} | {r.get('adapt_first_dred_seconds', '-')} | "
+                f"{r.get('recovered_dred', '0')} | {r.get('adapt_dred_effectiveness', 'not_entered')} |"
+            )
+        lines.append("")
+
+    lines.append("## 带宽 / WER 综合对比\n")
+    lines.append("| 音频类型 | 丢包场景 | 保护策略 | 发送载荷字节 | 平均载荷/包(bytes) | 有效载荷码率(kbps) | WER | 恢复率 |")
+    lines.append("|---------|---------|---------|-------------:|-------------------:|-------------------:|:---:|-------|")
+    for r in rows:
+        at = r.get("audio_type", "")
+        scenario = r.get("scenario", r.get("experiment", ""))
+        case = r.get("case", r.get("name", ""))
+        at_label = AUDIO_LABELS.get(at, at)
+        s_label = SCENARIO_LABELS.get(scenario, scenario)
+        c_label = CASE_LABELS.get(case, case)
+        wer_val = r.get("wer", "-")
+        rate = r.get("recovery_rate", "0")
+        rate_val = _safe_float(rate)
+        rate_str = f"{rate_val:.2%}" if rate_val <= 1.0 else f"{rate_val:.2f}%"
+        lines.append(
+            f"| {at_label} | {s_label} | {c_label} | {r.get('tx_bytes', '0')} | "
+            f"{r.get('tx_avg_payload_bytes', '-')} | {r.get('tx_effective_payload_kbps', '-')} | {wer_val} | {rate_str} |"
+        )
+    lines.append("")
+
+    # ---- WER 表 ----
+    lines.append("## 文本指标 (WER)\n")
+    lines.append("| 音频类型 | 丢包场景 | 保护策略 | WER | ASR稳定性 |")
     lines.append("|---------|---------|---------|:---:|:---:|")
     for r in rows:
         at = r.get("audio_type", "")
@@ -565,13 +792,24 @@ def generate_rtc_report(
         s_label = SCENARIO_LABELS.get(scenario, scenario)
         c_label = CASE_LABELS.get(case, case)
         wer_val = r.get("wer", "-")
-        ser_val = r.get("ser", "-")
-        lines.append(f"| {at_label} | {s_label} | {c_label} | {wer_val} | {ser_val} |")
+        asr_state = "unstable" if r.get("asr_unstable") == "yes" else "ok"
+        try:
+            wer_num = float(str(wer_val).rstrip("%"))
+        except ValueError:
+            wer_num = None
+        best_wer = best_rtc_wer.get((at, scenario))
+        if wer_num is not None and best_wer is not None and abs(wer_num - best_wer) < 1e-9:
+            wer_val = f"**{wer_val}**"
+        lines.append(f"| {at_label} | {s_label} | {c_label} | {wer_val} | {asr_state} |")
     lines.append("")
 
     lines.append("## 音频工件对照\n")
-    lines.append("| 音频类型 | 丢包场景 | 保护策略 | 输入音频 | 输出音频 | 参考转写 | 输出转写 | 统计 JSON |")
-    lines.append("|---------|---------|---------|---------|---------|---------|---------|---------|")
+    if has_adaptive_rows:
+        lines.append("| 音频类型 | 丢包场景 | 保护策略 | 输入音频 | 输出音频 | 参考转写 | 输出转写 | 统计 JSON | 自适应轨迹 |")
+        lines.append("|---------|---------|---------|---------|---------|---------|---------|---------|---------|")
+    else:
+        lines.append("| 音频类型 | 丢包场景 | 保护策略 | 输入音频 | 输出音频 | 参考转写 | 输出转写 | 统计 JSON |")
+        lines.append("|---------|---------|---------|---------|---------|---------|---------|---------|")
     for r in rows:
         at = r.get("audio_type", "")
         scenario = r.get("scenario", r.get("experiment", ""))
@@ -584,10 +822,17 @@ def generate_rtc_report(
         ref_text_ref = _artifact_link(output_path, r.get("reference_text_path", ""))
         hyp_text_ref = _artifact_link(output_path, r.get("hypothesis_text_path", ""))
         stats_ref = _artifact_link(output_path, r.get("stats_json", ""))
-        lines.append(
-            f"| {at_label} | {s_label} | {c_label} | {input_ref} | {output_ref} | "
-            f"{ref_text_ref} | {hyp_text_ref} | {stats_ref} |"
-        )
+        adaptation_ref = _artifact_link(output_path, r.get("adaptation_json", ""))
+        if has_adaptive_rows:
+            lines.append(
+                f"| {at_label} | {s_label} | {c_label} | {input_ref} | {output_ref} | "
+                f"{ref_text_ref} | {hyp_text_ref} | {stats_ref} | {adaptation_ref} |"
+            )
+        else:
+            lines.append(
+                f"| {at_label} | {s_label} | {c_label} | {input_ref} | {output_ref} | "
+                f"{ref_text_ref} | {hyp_text_ref} | {stats_ref} |"
+            )
     lines.append("")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -621,7 +866,7 @@ def generate_opus_report(
         output_wav = row.get("output_wav", "")
         experiment = row.get("experiment", "")
         case_name = row.get("name", "")
-        wer_value, ser_value, ref_text, hyp_text, ref_path, hyp_path = _stt_metrics(
+        wer_value, ref_text, hyp_text, ref_path, hyp_path, asr_unstable, instability_reason = _stt_metrics(
             input_wav,
             output_wav,
             row.get("audio_type", ""),
@@ -633,11 +878,13 @@ def generate_opus_report(
             transcript_cache,
         )
         row["wer"] = f"{wer_value:.2%}" if wer_value is not None else "-"
-        row["ser"] = f"{ser_value:.2%}" if ser_value is not None else "-"
         row["reference_text"] = ref_text or ""
         row["hypothesis_text"] = hyp_text or ""
         row["reference_text_path"] = ref_path or ""
         row["hypothesis_text_path"] = hyp_path or ""
+        row["asr_unstable"] = "yes" if asr_unstable else "no"
+        row["asr_unstable_reason"] = instability_reason
+    best_opus_wer = _group_best_wer(rows, ("audio_type", "experiment"))
 
     audio_types = list(dict.fromkeys(r.get("audio_type", "unknown") for r in rows))
 
@@ -655,7 +902,8 @@ def generate_opus_report(
 
     lines.append("## 文本指标说明\n")
     lines.append(f"- 当前报告 ASR 后端/模型：`{_resolved_asr_summary(stt_model)}`。")
-    lines.append("- WER / SER 使用同一个 ASR 后端分别转写干净输入音频与离线输出音频。")
+    lines.append("- `WER` 是主评估指标。")
+    lines.append("- WER 使用同一个 ASR 后端分别转写干净输入音频与离线输出音频。")
     lines.append("- `dialogue` 优先使用仓库内置参考文本，`news` 使用干净输入音频的转写结果作为参考文本。")
     lines.append("- 这里衡量的是不同恢复策略对可懂度的相对退化，作为离线回归的主评估指标。")
     lines.append("")
@@ -681,8 +929,8 @@ def generate_opus_report(
             lines.append(f"| {exp} | {name} | {model} | {lbrr} | {dred} | {plc} | {rate_str} |")
         lines.append("")
 
-    lines.append("## 文本指标 (WER / SER)\n")
-    lines.append("| 音频类型 | 实验 | 方案 | WER | SER |")
+    lines.append("## 文本指标 (WER)\n")
+    lines.append("| 音频类型 | 实验 | 方案 | WER | ASR稳定性 |")
     lines.append("|---------|------|------|:---:|:---:|")
     for r in rows:
         at = r.get("audio_type", "")
@@ -690,8 +938,15 @@ def generate_opus_report(
         exp = r.get("experiment", "")
         name = r.get("name", "")
         wer_val = r.get("wer", "-")
-        ser_val = r.get("ser", "-")
-        lines.append(f"| {at_label} | {exp} | {name} | {wer_val} | {ser_val} |")
+        asr_state = "unstable" if r.get("asr_unstable") == "yes" else "ok"
+        try:
+            wer_num = float(str(wer_val).rstrip("%"))
+        except ValueError:
+            wer_num = None
+        best_wer = best_opus_wer.get((at, exp))
+        if wer_num is not None and best_wer is not None and abs(wer_num - best_wer) < 1e-9:
+            wer_val = f"**{wer_val}**"
+        lines.append(f"| {at_label} | {exp} | {name} | {wer_val} | {asr_state} |")
     lines.append("")
 
     lines.append("## 音频工件对照\n")

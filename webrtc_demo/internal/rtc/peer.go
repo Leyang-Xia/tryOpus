@@ -27,6 +27,9 @@ func NewPeerConnection(config webrtc.Configuration, opts ...PeerOption) (*webrtc
 	}
 
 	interceptorRegistry := &interceptor.Registry{}
+	if err := webrtc.ConfigureTWCCHeaderExtensionSender(mediaEngine, interceptorRegistry); err != nil {
+		return nil, fmt.Errorf("configure twcc header extension failed: %w", err)
+	}
 	if params.receiverLoss != nil {
 		interceptorRegistry.Add(newLossInjectorFactory(*params.receiverLoss))
 	}

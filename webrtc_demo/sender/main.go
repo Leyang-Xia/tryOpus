@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"log"
+	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,6 +20,160 @@ import (
 	"opus_lab/webrtc_demo/internal/signal"
 	"opus_lab/webrtc_demo/internal/wav"
 )
+
+type adaptationSample struct {
+	Timestamp     string  `json:"timestamp"`
+	Loss          float64 `json:"loss"`
+	Burst         float64 `json:"burst"`
+	Jitter        float64 `json:"jitter"`
+	RTT           float64 `json:"rtt"`
+	REMBBps       float64 `json:"remb_bps"`
+	Mode          string  `json:"mode"`
+	FEC           bool    `json:"fec"`
+	PLP           int     `json:"plp"`
+	DRED          int     `json:"dred"`
+	Changed       bool    `json:"changed"`
+	HasBurst      bool    `json:"has_burst_metric"`
+	HasTransport  bool    `json:"has_transport_cc"`
+	Reason        string  `json:"reason"`
+	BitrateBps    int     `json:"bitrate_bps"`
+	BitrateTier   string  `json:"bitrate_tier"`
+	DecisionClass string  `json:"decision_class"`
+	DREDAllowed   bool    `json:"dred_allowed"`
+	DREDLevelCap  string  `json:"dred_level_cap"`
+}
+
+type adaptationTrace struct {
+	FeedbackIntervalSeconds float64            `json:"feedback_interval_seconds"`
+	Samples                 []adaptationSample `json:"samples"`
+}
+
+type senderStats struct {
+	PacketsSent          int               `json:"packets_sent"`
+	BytesSent            int               `json:"bytes_sent"`
+	AvgPayloadBytes      float64           `json:"avg_payload_bytes"`
+	InputFrames          int               `json:"input_frames"`
+	FrameDurationMS      int               `json:"frame_duration_ms"`
+	ConfiguredBitrate    int               `json:"configured_bitrate_bps"`
+	EffectivePayloadKbps float64           `json:"effective_payload_kbps"`
+	PayloadHistogram     []payloadBucket   `json:"payload_histogram,omitempty"`
+	DREDDebug            *dredDebugSummary `json:"dred_debug,omitempty"`
+}
+
+type payloadBucket struct {
+	PayloadBytes int `json:"payload_bytes"`
+	Count        int `json:"count"`
+}
+
+type dredDebugSummary struct {
+	DurationConfigured       int `json:"duration_configured"`
+	RequestedChunksCap       int `json:"requested_chunks_cap"`
+	TargetChunksCapUnderRate int `json:"target_chunks_cap_under_rate"`
+	Q0                       int `json:"q0"`
+	DQ                       int `json:"dQ"`
+	QMax                     int `json:"qmax"`
+	EstimatedTargetBitrate   int `json:"estimated_target_bitrate_bps"`
+	EstimatedAppliedBitrate  int `json:"estimated_applied_bitrate_bps"`
+	FramesObserved           int `json:"frames_observed"`
+	DistinctPayloadSizes     int `json:"distinct_payload_sizes"`
+	MostCommonPayloadBytes   int `json:"most_common_payload_bytes"`
+	MostCommonPayloadCount   int `json:"most_common_payload_count"`
+}
+
+var (
+	dredBitsTable = []float64{73.2, 68.1, 62.5, 57.0, 51.5, 45.7, 39.9, 32.4, 26.4, 20.4, 16.3, 13.0, 9.3, 8.2, 7.2, 6.4}
+	dredDQTable   = []int{0, 2, 3, 4, 6, 8, 12, 16}
+)
+
+func ecILog(v int) int {
+	n := 0
+	for v > 0 {
+		n++
+		v >>= 1
+	}
+	return n
+}
+
+func computeQuantizer(q0, dQ, qMax, i int) int {
+	quant := q0 + (dredDQTable[dQ]*i+8)/16
+	if quant > qMax {
+		return qMax
+	}
+	return quant
+}
+
+func bitrateToBits(bitrate, sampleRate, frameSize int) int {
+	return bitrate * 6 / (6 * sampleRate / frameSize)
+}
+
+func bitsToBitrate(bits, sampleRate, frameSize int) int {
+	return bits * (6 * sampleRate / frameSize) / 6
+}
+
+func estimateDREDBitrate(q0, dQ, qMax, duration, targetBits int) (int, int, int) {
+	requestedChunks := minInt((duration+5)/4, 26)
+	bits := 8.0*(3.0+2.0) + 50.0 + dredBitsTable[q0]
+	targetChunks := 0
+	for i := 0; i < requestedChunks; i++ {
+		q := computeQuantizer(q0, dQ, qMax, i)
+		bits += dredBitsTable[q]
+		if int(bits) < targetBits {
+			targetChunks = i + 1
+		}
+	}
+	return int(bits + 0.5), targetChunks, requestedChunks
+}
+
+func buildDREDDebugSummary(duration, bitrate, packetLoss, sampleRate, frameSize int, useFEC bool, payloadHistogram map[int]int, framesObserved int) *dredDebugSummary {
+	if duration <= 0 {
+		return nil
+	}
+	var dredFrac float64
+	bitrateOffset := 12000
+	if useFEC {
+		dredFrac = minFloat(0.7, 3.0*float64(packetLoss)/100.0)
+		bitrateOffset = 20000
+	} else if packetLoss > 5 {
+		dredFrac = minFloat(0.8, 0.55+float64(packetLoss)/100.0)
+	} else {
+		dredFrac = 12.0 * float64(packetLoss) / 100.0
+	}
+	dredFrac = dredFrac / (dredFrac + (1.0-dredFrac)*(float64(frameSize)*50.0)/float64(sampleRate))
+	q0 := minInt(15, maxInt(4, 51-3*ecILog(maxInt(1, bitrate-bitrateOffset))))
+	dQ := 5
+	if bitrate-bitrateOffset > 36000 {
+		dQ = 3
+	}
+	qMax := 15
+	targetBitrate := maxInt(0, int(dredFrac*float64(bitrate-bitrateOffset)))
+	targetBits := bitrateToBits(targetBitrate, sampleRate, frameSize)
+	maxDREDBits, targetChunks, requestedChunks := estimateDREDBitrate(q0, dQ, qMax, duration, targetBits)
+	appliedBitrate := minInt(targetBitrate, bitsToBitrate(maxDREDBits, sampleRate, frameSize))
+	if targetChunks < 2 {
+		appliedBitrate = 0
+	}
+	mostCommonPayloadBytes, mostCommonPayloadCount := 0, 0
+	for size, count := range payloadHistogram {
+		if count > mostCommonPayloadCount {
+			mostCommonPayloadBytes = size
+			mostCommonPayloadCount = count
+		}
+	}
+	return &dredDebugSummary{
+		DurationConfigured:       duration,
+		RequestedChunksCap:       requestedChunks,
+		TargetChunksCapUnderRate: targetChunks,
+		Q0:                       q0,
+		DQ:                       dQ,
+		QMax:                     qMax,
+		EstimatedTargetBitrate:   targetBitrate,
+		EstimatedAppliedBitrate:  appliedBitrate,
+		FramesObserved:           framesObserved,
+		DistinctPayloadSizes:     len(payloadHistogram),
+		MostCommonPayloadBytes:   mostCommonPayloadBytes,
+		MostCommonPayloadCount:   mostCommonPayloadCount,
+	}
+}
 
 func main() {
 	var (
@@ -38,6 +195,8 @@ func main() {
 		feedbackInterval   time.Duration
 		adaptWindow        time.Duration
 		adaptLog           bool
+		adaptationJSON     string
+		senderStatsJSON    string
 	)
 
 	flag.StringVar(&signalURL, "signal", "http://127.0.0.1:8090", "signaling server base URL")
@@ -58,6 +217,8 @@ func main() {
 	flag.DurationVar(&feedbackInterval, "feedback-interval", time.Second, "feedback polling interval")
 	flag.DurationVar(&adaptWindow, "adapt-window", 5*time.Second, "smoothing window duration")
 	flag.BoolVar(&adaptLog, "adapt-log", true, "log adaptive redundancy feedback and switches")
+	flag.StringVar(&adaptationJSON, "adaptation-json", "", "optional path to write adaptive control trace json")
+	flag.StringVar(&senderStatsJSON, "sender-stats-json", "", "optional path to write sender payload stats json")
 	flag.Parse()
 
 	if sessionID == "" {
@@ -81,6 +242,16 @@ func main() {
 	if dnnBlobPath != "" {
 		if absPath, err := filepath.Abs(dnnBlobPath); err == nil {
 			dnnBlobPath = absPath
+		}
+	}
+	if adaptationJSON != "" {
+		if absPath, err := filepath.Abs(adaptationJSON); err == nil {
+			adaptationJSON = absPath
+		}
+	}
+	if senderStatsJSON != "" {
+		if absPath, err := filepath.Abs(senderStatsJSON); err == nil {
+			senderStatsJSON = absPath
 		}
 	}
 
@@ -256,12 +427,16 @@ func main() {
 		collector := adaptation.NewCollector()
 		controllerCfg := adaptation.DefaultControllerConfig()
 		controllerCfg.SupportsDRED = supportsDRED
+		controllerCfg.BitrateBps = bitrate
 		controllerCfg.Cooling = 3 * time.Second
 		controllerCfg.PromoteConsecutive = maxInt(2, int((2*time.Second)/feedbackInterval))
 		controllerCfg.DemoteConsecutive = maxInt(5, int((adaptWindow)/feedbackInterval))
+		controllerCfg.DREDPromoteConsecutive = maxInt(2, controllerCfg.PromoteConsecutive)
 		var (
 			controllerState adaptation.ControllerState
 			prevPacketsLost int32
+			traceMu         sync.Mutex
+			traceSamples    []adaptationSample
 		)
 
 		go func() {
@@ -294,9 +469,33 @@ func main() {
 				snap := collector.Snapshot(pc.GetStats(), &prevPacketsLost)
 				decision, changed := adaptation.Observe(controllerCfg, &controllerState, snap)
 				if adaptLog {
-					log.Printf("adaptive snapshot loss=%.3f burst=%.3f jitter=%.3f rtt=%.3f remb=%.0f mode=%s reason=%s",
+					log.Printf("adaptive snapshot bitrate=%d tier=%s class=%s loss=%.3f burst=%.3f jitter=%.3f rtt=%.3f remb=%.0f mode=%s reason=%s",
+						decision.BitrateBps, decision.BitrateTier, decision.DecisionClass,
 						snap.FractionLost, snap.BurstLossRate, snap.JitterSeconds, snap.RTTSeconds, snap.REMBBps, decision.Mode, decision.Reason)
 				}
+				traceMu.Lock()
+				traceSamples = append(traceSamples, adaptationSample{
+					Timestamp:     snap.Timestamp.Format(time.RFC3339Nano),
+					Loss:          snap.FractionLost,
+					Burst:         snap.BurstLossRate,
+					Jitter:        snap.JitterSeconds,
+					RTT:           snap.RTTSeconds,
+					REMBBps:       snap.REMBBps,
+					Mode:          string(decision.Mode),
+					FEC:           decision.FEC,
+					PLP:           decision.PLP,
+					DRED:          decision.DRED,
+					Changed:       changed,
+					HasBurst:      snap.HasBurstMetric,
+					HasTransport:  snap.HasTransportCC,
+					Reason:        decision.Reason,
+					BitrateBps:    decision.BitrateBps,
+					BitrateTier:   decision.BitrateTier,
+					DecisionClass: decision.DecisionClass,
+					DREDAllowed:   decision.DREDAllowed,
+					DREDLevelCap:  decision.DREDLevelCap,
+				})
+				traceMu.Unlock()
 				if !changed {
 					continue
 				}
@@ -325,9 +524,36 @@ func main() {
 					}
 				}
 				encMu.Unlock()
-				log.Printf("adaptive applied mode=%s fec=%v plp=%d dred=%d reason=%s",
-					decision.Mode, decision.FEC, decision.PLP, decision.DRED, decision.Reason)
+				log.Printf("adaptive applied bitrate=%d tier=%s class=%s mode=%s fec=%v plp=%d dred=%d dred_allowed=%v dred_cap=%s reason=%s",
+					decision.BitrateBps, decision.BitrateTier, decision.DecisionClass,
+					decision.Mode, decision.FEC, decision.PLP, decision.DRED, decision.DREDAllowed, decision.DREDLevelCap, decision.Reason)
 			}
+		}()
+
+		defer func() {
+			if adaptationJSON == "" {
+				return
+			}
+			traceMu.Lock()
+			trace := adaptationTrace{
+				FeedbackIntervalSeconds: feedbackInterval.Seconds(),
+				Samples:                 append([]adaptationSample(nil), traceSamples...),
+			}
+			traceMu.Unlock()
+			if err := os.MkdirAll(filepath.Dir(adaptationJSON), 0o755); err != nil {
+				log.Printf("write adaptation trace mkdir failed: %v", err)
+				return
+			}
+			data, err := json.MarshalIndent(trace, "", "  ")
+			if err != nil {
+				log.Printf("marshal adaptation trace failed: %v", err)
+				return
+			}
+			if err := os.WriteFile(adaptationJSON, data, 0o644); err != nil {
+				log.Printf("write adaptation trace failed: %v", err)
+				return
+			}
+			log.Printf("adaptive trace saved: %s", adaptationJSON)
 		}()
 	} else {
 		go func() {
@@ -353,6 +579,11 @@ func main() {
 	packetBuf := make([]byte, 4000)
 	stereoPCM := make([]int16, samplesPerFrame*2)
 	frameDuration := time.Duration(frameMS) * time.Millisecond
+	stats := senderStats{
+		FrameDurationMS:   frameMS,
+		ConfiguredBitrate: bitrate,
+	}
+	payloadHistogram := map[int]int{}
 	for i := 0; i < frameCount; i++ {
 		start := i * samplesPerFrame
 		end := start + samplesPerFrame
@@ -374,15 +605,66 @@ func main() {
 		}); writeErr != nil {
 			log.Fatalf("write sample frame=%d failed: %v", i, writeErr)
 		}
+		stats.PacketsSent++
+		stats.BytesSent += n
+		payloadHistogram[n]++
 		time.Sleep(frameDuration)
 	}
+	stats.InputFrames = frameCount
+	if stats.PacketsSent > 0 {
+		stats.AvgPayloadBytes = float64(stats.BytesSent) / float64(stats.PacketsSent)
+	}
+	totalSeconds := float64(frameCount*frameMS) / 1000.0
+	if totalSeconds > 0 {
+		stats.EffectivePayloadKbps = float64(stats.BytesSent*8) / totalSeconds / 1000.0
+	}
+	if len(payloadHistogram) > 0 {
+		keys := make([]int, 0, len(payloadHistogram))
+		for size := range payloadHistogram {
+			keys = append(keys, size)
+		}
+		sort.Ints(keys)
+		stats.PayloadHistogram = make([]payloadBucket, 0, len(keys))
+		for _, size := range keys {
+			stats.PayloadHistogram = append(stats.PayloadHistogram, payloadBucket{
+				PayloadBytes: size,
+				Count:        payloadHistogram[size],
+			})
+		}
+	}
+	stats.DREDDebug = buildDREDDebugSummary(dredDuration, bitrate, packetLoss, 48000, samplesPerFrame, enableFEC, payloadHistogram, frameCount)
 
 	log.Printf("send complete: %d frames, input=%s", frameCount, inputWAV)
+	if senderStatsJSON != "" {
+		if err := os.MkdirAll(filepath.Dir(senderStatsJSON), 0o755); err != nil {
+			log.Printf("write sender stats mkdir failed: %v", err)
+		} else if data, err := json.MarshalIndent(stats, "", "  "); err != nil {
+			log.Printf("marshal sender stats failed: %v", err)
+		} else if err := os.WriteFile(senderStatsJSON, data, 0o644); err != nil {
+			log.Printf("write sender stats failed: %v", err)
+		} else {
+			log.Printf("sender stats saved: %s", senderStatsJSON)
+		}
+	}
 	time.Sleep(500 * time.Millisecond)
 }
 
 func maxInt(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func minFloat(a, b float64) float64 {
+	if a < b {
 		return a
 	}
 	return b
