@@ -20,6 +20,7 @@ OUTPUT_WAV="${TMP_DIR}/received.wav"
 STATS_JSON="${TMP_DIR}/stats.json"
 OPUS_PKG_CONFIG="${OPUS_PKG_CONFIG:-${ROOT_DIR}/../opus-install/lib/pkgconfig}"
 PROJECT_OPUS_DYLIB="${PROJECT_OPUS_DYLIB:-${ROOT_DIR}/../opus-install/lib/libopus.0.dylib}"
+PROJECT_OPUS_SO="${PROJECT_OPUS_SO:-${ROOT_DIR}/../opus-install/lib/libopus.so.0}"
 export PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}:${PKG_CONFIG_PATH:-}"
 export LD_LIBRARY_PATH="${ROOT_DIR}/../opus-install/lib:${LD_LIBRARY_PATH:-}"
 export DYLD_LIBRARY_PATH="${ROOT_DIR}/../opus-install/lib:${DYLD_LIBRARY_PATH:-}"
@@ -42,14 +43,29 @@ verify_binary_libopus() {
   local bin_path="$1"
   local linked_path
   local expected_path
+  local os_name
 
-  expected_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PROJECT_OPUS_DYLIB}")"
+  os_name="$(uname -s)"
+  case "${os_name}" in
+    Darwin)
+      expected_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PROJECT_OPUS_DYLIB}")"
+      linked_path="$(otool -L "${bin_path}" | awk '/libopus\.0\.dylib/ {print $1; exit}')"
+      ;;
+    Linux)
+      expected_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PROJECT_OPUS_SO}")"
+      linked_path="$(ldd "${bin_path}" | awk '/libopus\.so/ {print $3; exit}')"
+      ;;
+    *)
+      echo "[test] WARN: skip libopus linkage validation on unsupported OS: ${os_name}" >&2
+      return 0
+      ;;
+  esac
 
-  linked_path="$(otool -L "${bin_path}" | awk '/libopus\.0\.dylib/ {print $1; exit}')"
-  if [[ -z "${linked_path}" ]]; then
+  if [[ -z "${linked_path}" || "${linked_path}" == "not" ]]; then
     echo "[test] ERROR: ${bin_path} is missing libopus dependency" >&2
     exit 1
   fi
+
   linked_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${linked_path}")"
   if [[ "${linked_path}" != "${expected_path}" ]]; then
     echo "[test] ERROR: ${bin_path} linked unexpected libopus: ${linked_path}" >&2
