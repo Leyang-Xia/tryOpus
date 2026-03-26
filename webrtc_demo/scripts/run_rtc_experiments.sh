@@ -54,6 +54,7 @@ SIGNAL_URL="http://127.0.0.1:${SIGNAL_PORT}"
 
 OPUS_PKG_CONFIG="${OPUS_PKG_CONFIG:-${WORKSPACE_DIR}/opus-install/lib/pkgconfig}"
 PROJECT_OPUS_DYLIB="${PROJECT_OPUS_DYLIB:-${WORKSPACE_DIR}/opus-install/lib/libopus.0.dylib}"
+PROJECT_OPUS_SO="${PROJECT_OPUS_SO:-${WORKSPACE_DIR}/opus-install/lib/libopus.so.0}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${WORKSPACE_DIR}/weights_blob.bin}"
 SIM_SEED="${SIM_SEED:-42}"
 REP_AUDIO_DIR="${REP_AUDIO_DIR:-${WORKSPACE_DIR}/representative_audio}"
@@ -122,11 +123,25 @@ verify_binary_libopus() {
   local bin_path="$1"
   local linked_path
   local expected_path
+  local os_name
 
-  expected_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PROJECT_OPUS_DYLIB}")"
+  os_name="$(uname -s)"
+  case "${os_name}" in
+    Darwin)
+      expected_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PROJECT_OPUS_DYLIB}")"
+      linked_path="$(otool -L "${bin_path}" | awk '/libopus\.0\.dylib/ {print $1; exit}')"
+      ;;
+    Linux)
+      expected_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PROJECT_OPUS_SO}")"
+      linked_path="$(ldd "${bin_path}" | awk '/libopus\.so/ {print $3; exit}')"
+      ;;
+    *)
+      echo "[exp] WARN: skip libopus linkage validation on unsupported OS: ${os_name}" >&2
+      return 0
+      ;;
+  esac
 
-  linked_path="$(otool -L "${bin_path}" | awk '/libopus\.0\.dylib/ {print $1; exit}')"
-  if [[ -z "${linked_path}" ]]; then
+  if [[ -z "${linked_path}" || "${linked_path}" == "not" ]]; then
     echo "[exp] ${bin_path} is missing libopus dependency" >&2
     exit 1
   fi
