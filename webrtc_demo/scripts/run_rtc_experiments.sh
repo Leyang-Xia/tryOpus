@@ -25,9 +25,16 @@ set -euo pipefail
 #   REP_AUDIO_DIR     代表性音频根目录 (默认 <repo>/representative_audio)
 #   BIN_DIR           sender/receiver/signaling 二进制缓存目录
 #   REPORT_MD         报告输出路径
-#   ASR_PYTHON        用于生成 WER/SER 报告的 Python (默认 .venv_asr/bin/python, 否则 python3)
+#   ASR_PYTHON        用于生成 WER 报告的 Python (默认 .venv_asr/bin/python, 否则 python3)
 #   STT_MODEL         Whisper 模型名 (默认 small.en)
 #   RTC_STT_BACKEND   ASR 后端: mlx|faster|auto (默认 Apple Silicon 上为 mlx)
+#   SENDER_BITRATE    Opus 目标码率 bps (默认 32000)
+#   SENDER_ADAPTIVE_REDUNDANCY true|false (默认 true)
+#   SENDER_FEEDBACK_INTERVAL   自适应采样周期 (默认 1s)
+#   SENDER_ADAPT_WINDOW        自适应平滑窗口 (默认 5s)
+#   EXTRA_DRED_VALUES          逗号分隔的额外 DRED duration，如 10,20,50,100
+#   STRATEGY_FILTER            逗号分隔的策略名过滤，如 baseline,dred_5
+#   SCENARIO_FILTER            逗号分隔的场景名过滤，如 uniform_10,ge_moderate
 # ==========================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,6 +53,7 @@ fi
 SIGNAL_URL="http://127.0.0.1:${SIGNAL_PORT}"
 
 OPUS_PKG_CONFIG="${OPUS_PKG_CONFIG:-${WORKSPACE_DIR}/opus-install/lib/pkgconfig}"
+PROJECT_OPUS_DYLIB="${PROJECT_OPUS_DYLIB:-${WORKSPACE_DIR}/opus-install/lib/libopus.0.dylib}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${WORKSPACE_DIR}/weights_blob.bin}"
 SIM_SEED="${SIM_SEED:-42}"
 REP_AUDIO_DIR="${REP_AUDIO_DIR:-${WORKSPACE_DIR}/representative_audio}"
@@ -59,24 +67,33 @@ OUTPUT_DIR="${RUN_DIR}/outputs"
 STATS_DIR="${RUN_DIR}/stats"
 LOG_DIR="${RUN_DIR}/logs"
 TRANSCRIPT_DIR="${RUN_DIR}/transcripts"
+ADAPT_DIR="${RUN_DIR}/adaptation"
 AUDIO_MANIFEST="${AUDIO_MANIFEST:-${RUN_DIR}/audio_manifest.txt}"
 SUMMARY_CSV="${SUMMARY_CSV:-${RUN_DIR}/rtc_experiment_summary.csv}"
 REPORT_MD="${REPORT_MD:-${RUN_DIR}/rtc_report.md}"
 LATEST_LINK="${WORKSPACE_DIR}/results/rtc_latest"
 LATEST_REPORT="${WORKSPACE_DIR}/results/rtc_report.md"
 BIN_DIR="${BIN_DIR:-${WORKSPACE_DIR}/results/rtc_bin_cache}"
+GO_CACHE_DIR="${GO_CACHE_DIR:-${WORKSPACE_DIR}/results/rtc_go_cache}"
 ASR_PYTHON="${ASR_PYTHON:-${WORKSPACE_DIR}/.venv_asr/bin/python}"
 STT_MODEL="${STT_MODEL:-small.en}"
+SENDER_BITRATE="${SENDER_BITRATE:-32000}"
 SENDER_COMPLEXITY="${SENDER_COMPLEXITY:-9}"
 SENDER_SIGNAL="${SENDER_SIGNAL:-auto}"
+SENDER_ADAPTIVE_REDUNDANCY="${SENDER_ADAPTIVE_REDUNDANCY:-true}"
+SENDER_FEEDBACK_INTERVAL="${SENDER_FEEDBACK_INTERVAL:-1s}"
+SENDER_ADAPT_WINDOW="${SENDER_ADAPT_WINDOW:-5s}"
+EXTRA_DRED_VALUES="${EXTRA_DRED_VALUES:-}"
+STRATEGY_FILTER="${STRATEGY_FILTER:-}"
+SCENARIO_FILTER="${SCENARIO_FILTER:-}"
 EXPERIMENT_SUITE="${EXPERIMENT_SUITE:-standard}"
 
 if [[ ! -x "${ASR_PYTHON}" ]]; then
   ASR_PYTHON="${ASR_PYTHON_FALLBACK:-python3}"
 fi
 
-mkdir -p "${RUN_DIR}" "${INPUT_DIR}" "${OUTPUT_DIR}" "${STATS_DIR}" "${LOG_DIR}" "${TRANSCRIPT_DIR}" \
-         "$(dirname "${LATEST_LINK}")" "$(dirname "${LATEST_REPORT}")" "${BIN_DIR}"
+mkdir -p "${RUN_DIR}" "${INPUT_DIR}" "${OUTPUT_DIR}" "${STATS_DIR}" "${LOG_DIR}" "${TRANSCRIPT_DIR}" "${ADAPT_DIR}" \
+         "$(dirname "${LATEST_LINK}")" "$(dirname "${LATEST_REPORT}")" "${BIN_DIR}" "${GO_CACHE_DIR}"
 
 export PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}:${PKG_CONFIG_PATH:-}"
 export LD_LIBRARY_PATH="${WORKSPACE_DIR}/opus-install/lib:${LD_LIBRARY_PATH:-}"
@@ -92,13 +109,53 @@ build_binaries() {
   echo "[exp] building rtc binaries into ${BIN_DIR}"
   (
     cd "${ROOT_DIR}"
-    go build -o "${BIN_DIR}/signaling" ./signaling
-    go build -o "${BIN_DIR}/receiver" ./receiver
-    go build -o "${BIN_DIR}/sender" ./sender
+    PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}" GOCACHE="${GO_CACHE_DIR}" go build -o "${BIN_DIR}/signaling" ./signaling
+    PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}" GOCACHE="${GO_CACHE_DIR}" go build -o "${BIN_DIR}/receiver" ./receiver
+    PKG_CONFIG_PATH="${OPUS_PKG_CONFIG}" GOCACHE="${GO_CACHE_DIR}" go build -o "${BIN_DIR}/sender" ./sender
   )
+
+  verify_binary_libopus "${BIN_DIR}/receiver"
+  verify_binary_libopus "${BIN_DIR}/sender"
+}
+
+verify_binary_libopus() {
+  local bin_path="$1"
+  local linked_path
+  local expected_path
+
+  expected_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PROJECT_OPUS_DYLIB}")"
+
+  linked_path="$(otool -L "${bin_path}" | awk '/libopus\.0\.dylib/ {print $1; exit}')"
+  if [[ -z "${linked_path}" ]]; then
+    echo "[exp] ${bin_path} is missing libopus dependency" >&2
+    exit 1
+  fi
+  linked_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${linked_path}")"
+  if [[ "${linked_path}" != "${expected_path}" ]]; then
+    echo "[exp] ${bin_path} linked unexpected libopus: ${linked_path}" >&2
+    echo "[exp] expected project libopus: ${expected_path}" >&2
+    exit 1
+  fi
 }
 
 build_binaries
+
+matches_filter() {
+  local name="$1"
+  local filter_csv="$2"
+  local item
+
+  if [[ -z "${filter_csv}" ]]; then
+    return 0
+  fi
+  IFS=',' read -r -a _filters <<< "${filter_csv}"
+  for item in "${_filters[@]}"; do
+    if [[ "${name}" == "${item}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
 
 # ---- 检查代表性音频 ----
 if [[ ! -f "${REP_AUDIO_MANIFEST}" ]]; then
@@ -125,7 +182,7 @@ while IFS='|' read -r audio_type rel_wav; do
 done < "${REP_AUDIO_MANIFEST}"
 
 # ---- CSV header ----
-echo "audio_type,scenario,case,sim_mode,sim_loss,recovered_lbrr,recovered_dred,plc,decode_errors,recovery_rate,input_wav,output_wav,stats_json" \
+echo "audio_type,scenario,case,sim_mode,sim_loss,recovered_lbrr,recovered_dred,plc,decode_errors,recovery_rate,input_wav,output_wav,stats_json,sender_stats_json,adaptation_json" \
   > "${SUMMARY_CSV}"
 
 # ---- 启动信令服务 ----
@@ -155,10 +212,17 @@ run_case() {
   local session="session-${audio_type}-${scenario_name}-${case_name}-$(date +%s%N)"
   local output_wav="${OUTPUT_DIR}/${audio_type}/${scenario_name}/${case_name}.wav"
   local stats_json="${STATS_DIR}/${audio_type}/${scenario_name}/${case_name}.json"
+  local sender_stats_json="${STATS_DIR}/${audio_type}/${scenario_name}/${case_name}_sender.json"
+  local adaptation_json="${ADAPT_DIR}/${audio_type}/${scenario_name}/${case_name}.json"
+  local sender_adaptive="false"
 
-  mkdir -p "$(dirname "${output_wav}")" "$(dirname "${stats_json}")"
+  if [[ "${case_name}" == "adaptive_auto" ]]; then
+    sender_adaptive="${SENDER_ADAPTIVE_REDUNDANCY}"
+  fi
 
-  echo "[exp] audio=${audio_type} scenario=${scenario_name} case=${case_name}"
+  mkdir -p "$(dirname "${output_wav}")" "$(dirname "${stats_json}")" "$(dirname "${adaptation_json}")"
+
+  echo "[exp] audio=${audio_type} scenario=${scenario_name} case=${case_name} adaptive=${sender_adaptive}"
   (
     cd "${ROOT_DIR}"
     "${BIN_DIR}/receiver" \
@@ -181,8 +245,14 @@ run_case() {
       --signal "${SIGNAL_URL}" \
       --session "${session}" \
       --input "${input_wav}" \
+      --bitrate "${SENDER_BITRATE}" \
       --complexity "${SENDER_COMPLEXITY}" \
       --signal-hint "${SENDER_SIGNAL}" \
+      --adaptive-redundancy="${sender_adaptive}" \
+      --feedback-interval "${SENDER_FEEDBACK_INTERVAL}" \
+      --adapt-window "${SENDER_ADAPT_WINDOW}" \
+      --adaptation-json "${adaptation_json}" \
+      --sender-stats-json "${sender_stats_json}" \
       --weights "${WEIGHTS_PATH}" ${sender_extra} \
       >"${LOG_DIR}/${audio_type}_${scenario_name}_${case_name}_sender.log" 2>&1
   )
@@ -195,10 +265,10 @@ run_case() {
   fi
 
   python3 - "${audio_type}" "${scenario_name}" "${case_name}" "${sim_mode}" "${sim_loss_label}" \
-             "${stats_json}" "${input_wav}" "${output_wav}" "${SUMMARY_CSV}" <<'PY'
+             "${stats_json}" "${sender_stats_json}" "${input_wav}" "${output_wav}" "${adaptation_json}" "${SUMMARY_CSV}" <<'PY'
 import json, sys
 
-audio_type, scenario, case_name, sim_mode, sim_loss, stats_path, input_wav, output_wav, summary_csv = sys.argv[1:10]
+audio_type, scenario, case_name, sim_mode, sim_loss, stats_path, sender_stats_path, input_wav, output_wav, adaptation_json, summary_csv = sys.argv[1:12]
 with open(stats_path, "r", encoding="utf-8") as f:
     s = json.load(f)
 row = ",".join([
@@ -209,7 +279,7 @@ row = ",".join([
     str(s.get("decode_errors", 0)),
     f'{s.get("recovery_rate", 0.0):.4f}',
     input_wav, output_wav,
-    stats_path,
+    stats_path, sender_stats_path, adaptation_json,
 ])
 with open(summary_csv, "a", encoding="utf-8") as out:
     out.write(row + "\n")
@@ -223,8 +293,10 @@ PY
 # ================================================================
 declare -a STRATEGIES_QUICK=(
   "baseline|--fec=false --dred=0 --plp=0|--use-lbrr=false --use-dred=false"
+  "adaptive_auto|--fec=false --dred=0 --plp=0|--use-lbrr=true --use-dred=true"
   "lbrr_only|--fec=true --dred=0 --plp=15|--use-lbrr=true --use-dred=false"
   "dred_3|--fec=false --dred=3 --plp=15|--use-lbrr=false --use-dred=true"
+  "dred_5|--fec=false --dred=5 --plp=15|--use-lbrr=false --use-dred=true"
 )
 
 declare -a STRATEGIES_FULL=(
@@ -233,6 +305,22 @@ declare -a STRATEGIES_FULL=(
   "dred_3|--fec=false --dred=3 --plp=15|--use-lbrr=false --use-dred=true"
   "dred_5|--fec=false --dred=5 --plp=15|--use-lbrr=false --use-dred=true"
 )
+
+append_extra_dred_strategies() {
+  local value
+  local case_name
+
+  [[ -z "${EXTRA_DRED_VALUES}" ]] && return 0
+  IFS=',' read -r -a _extra_dred_values <<< "${EXTRA_DRED_VALUES}"
+  for value in "${_extra_dred_values[@]}"; do
+    [[ -z "${value}" ]] && continue
+    case_name="dred_${value}"
+    STRATEGIES_QUICK+=("${case_name}|--fec=false --dred=${value} --plp=15|--use-lbrr=false --use-dred=true")
+    STRATEGIES_FULL+=("${case_name}|--fec=false --dred=${value} --plp=15|--use-lbrr=false --use-dred=true")
+  done
+}
+
+append_extra_dred_strategies
 
 # ================================================================
 # 丢包场景定义
@@ -281,6 +369,28 @@ case "${EXPERIMENT_SUITE}" in
     ;;
 esac
 
+if [[ -n "${SCENARIO_FILTER}" ]]; then
+  filtered_scenarios=()
+  for scenario_def in "${SCENARIOS[@]}"; do
+    IFS='|' read -r scenario_name _ <<< "${scenario_def}"
+    if matches_filter "${scenario_name}" "${SCENARIO_FILTER}"; then
+      filtered_scenarios+=("${scenario_def}")
+    fi
+  done
+  SCENARIOS=("${filtered_scenarios[@]}")
+fi
+
+if [[ -n "${STRATEGY_FILTER}" ]]; then
+  filtered_strategies=()
+  for strategy_def in "${STRATEGIES[@]}"; do
+    IFS='|' read -r case_name _ <<< "${strategy_def}"
+    if matches_filter "${case_name}" "${STRATEGY_FILTER}"; then
+      filtered_strategies+=("${strategy_def}")
+    fi
+  done
+  STRATEGIES=("${filtered_strategies[@]}")
+fi
+
 # ---- 打印实验矩阵 ----
 n_audio=$(wc -l < "${AUDIO_MANIFEST}")
 n_scenarios=${#SCENARIOS[@]}
@@ -300,6 +410,9 @@ echo " 总实验数   : ${total}"
 echo " 接收时长   : ${RECV_DURATION}"
 echo " 编码复杂度 : ${SENDER_COMPLEXITY}"
 echo " Signal提示 : ${SENDER_SIGNAL}"
+echo " 自适应冗余 : ${SENDER_ADAPTIVE_REDUNDANCY}"
+echo " 反馈周期   : ${SENDER_FEEDBACK_INTERVAL}"
+echo " 平滑窗口   : ${SENDER_ADAPT_WINDOW}"
 echo " 二进制缓存 : ${BIN_DIR}"
 echo " 报告输出   : ${REPORT_MD}"
 echo "========================================================"

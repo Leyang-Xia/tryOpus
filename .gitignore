@@ -10,9 +10,10 @@ results/*.log
 results/offline_runs/
 results/offline_latest
 results/offline_report.md
+results/emotion_eval/
 results/rtc_runs/
 results/rtc_bin_cache/
-
+results/rtc_go_cache/
 # IDE
 .vscode/
 .cache/

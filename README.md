@@ -33,6 +33,7 @@
 
 - [LBRR 技术分析](docs/LBRR_技术分析.md) — 带内 FEC 机制、激活条件、实测覆盖率、改进方向
 - [DRED / PLC 技术分析](docs/DRED_PLC_深度分析.md) — 神经网络冗余恢复与丢包隐藏
+- [DRED 源码实现分析](docs/Opus_DRED_源码实现分析.md) — `opus-src/dnn` 与 Opus 主链路中的 DRED 模块职责、数据流、接口和改造风险
 - [FEC 新方案探索](docs/Opus_FEC_新方案探索报告.md) — 六个新方案方向的技术调研
 - [端到端落地方案](docs/端到端落地方案.md) — AI 语音聊天 RTC 场景的优化呈现与集成方案
 
