@@ -1,169 +1,305 @@
-# Pion WebRTC 方案 B：音频 P2P 轻量实现
+# WebRTC 验证
 
-对应 `docs/端到端落地方案.md` 的 **方案 B**。仓库顶层与之同级的 `offline_validation/` 负责非 RTC 验证；本目录只承接 RTC 验证，目录如下：
+`webrtc_demo/` 是仓库里的 RTC 验证入口，基于 **Go + Pion WebRTC** 实现。它不是浏览器 Demo，而是一套用于研究 Opus 冗余保护的可控实验链路：
 
-```
+- `signaling`：极简 HTTP 信令
+- `sender`：WAV -> 本地 `libopus` 编码 -> WebRTC 发送
+- `receiver`：WebRTC 接收 -> 本地 `libopus` 解码 -> WAV 输出
+- `scripts/run_rtc_experiments.sh`：批量跑 RTC 弱网实验并生成报告
+
+## 当前架构
+
+```text
 webrtc_demo/
-├── internal/opusx/       # 本地 libopus(含DRED) cgo 封装
-├── signaling/            # HTTP 信令服务
-├── sender/               # WAV -> Opus -> WebRTC 发送
-├── receiver/             # WebRTC 接收 -> Opus 解码 -> WAV
+├── internal/
+│   ├── adaptation/   # sender 侧动态冗余控制器
+│   ├── opusx/        # cgo 封装项目内 libopus
+│   ├── rtc/          # Pion 封装与 receiver-side 丢包注入
+│   ├── signal/       # 信令客户端/协议
+│   └── wav/          # 48k PCM16 mono WAV 读写
+├── signaling/
+├── sender/
+├── receiver/
 ├── scripts/
-│   ├── run_test.sh                     # 一键端到端测试
-│   ├── run_rtc_experiments.sh          # RTC 传输模拟实验矩阵（含报告生成）
-│   ├── gen_tone.py                     # 生成 48k 单声道测试音频
-│   └── prepare_representative_audio.py # 代表性音频更新（委托 tools/ 版本）
+│   ├── run_test.sh
+│   ├── run_rtc_experiments.sh
+│   ├── gen_tone.py
+│   └── prepare_representative_audio.py
+├── go.mod
+└── README.md
 ```
 
-## 依赖准备（本地 Opus + DRED）
+## 关键实现边界
 
-```bash
-ROOT_DIR=$(pwd)
-export PKG_CONFIG_PATH=${ROOT_DIR}/../opus-install/lib/pkgconfig:${PKG_CONFIG_PATH}
-export LD_LIBRARY_PATH=${ROOT_DIR}/../opus-install/lib:${LD_LIBRARY_PATH}
-```
+### `internal/opusx`
 
-在 macOS 上，`go build` / `go run` 可能因为 cgo build cache 复用而错误链接到 Homebrew 的 `libopus`。当前 `scripts/run_test.sh` 和 `scripts/run_rtc_experiments.sh` 已经内置：
+直接绑定项目内 `libopus`，支持：
 
-- `go clean -cache`
-- 用项目内 `opus-install/lib/pkgconfig` 重建
-- 用 `otool -L` 校验 sender/receiver 必须链接到项目内 `libopus.0.dylib`
-
-`sender` / `receiver` 会通过 `internal/opusx` 直接调用本地 `libopus`，并支持：
-
+- `OPUS_SET_INBAND_FEC`
+- `OPUS_SET_PACKET_LOSS_PERC`
 - `OPUS_SET_DRED_DURATION`
 - `OPUS_SET_DNN_BLOB`
 - `opus_dred_parse`
 - `opus_decoder_dred_decode`
 
-### 手动运行
+### `internal/rtc`
 
-终端 1：启动信令
+- 初始化 Pion `PeerConnection`
+- 注册默认 codec / interceptor
+- 为 sender 打开 TWCC header extension
+- 支持在 receiver 侧用 interceptor 注入均匀丢包或 GE 突发丢包
+
+### `internal/adaptation`
+
+sender 侧根据以下反馈做冗余切换：
+
+- RTCP Receiver Report
+- REMB
+- Pion `GetStats()`
+- TWCC 派生的 burst 指标
+
+控制结果会落到：
+
+- `FEC`
+- `PLP`
+- `DRED duration`
+- `adaptation.json`
+
+## 依赖准备
+
+### 1. Go 版本
+
+```bash
+go version
+```
+
+要求 `>= 1.22`。
+
+### 2. 使用项目内 Opus 运行时
 
 ```bash
 cd webrtc_demo
-go run ./signaling -addr :8090
+export PKG_CONFIG_PATH="$(pwd)/../opus-install/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export LD_LIBRARY_PATH="$(pwd)/../opus-install/lib:${LD_LIBRARY_PATH:-}"
+export DYLD_LIBRARY_PATH="$(pwd)/../opus-install/lib:${DYLD_LIBRARY_PATH:-}"
 ```
 
-终端 2：启动接收端
+### 3. 权重文件
 
-```bash
-cd webrtc_demo
-go run ./receiver \
-  --signal http://127.0.0.1:8090 \
-  --session demo-session \
-  --weights ${PWD}/../weights_blob.bin \
-  --output /tmp/received.wav \
-  --duration 8s \
-  --sim-loss 0.10 \
-  --use-dred=true
+默认使用：
+
+```text
+../weights_blob.bin
 ```
 
-终端 3：启动发送端
-
-```bash
-cd webrtc_demo
-go run ./sender \
-  --signal http://127.0.0.1:8090 \
-  --session demo-session \
-  --input /path/to/input_48k_mono.wav \
-  --weights ${PWD}/../weights_blob.bin \
-  --dred 3 --plp 15 --fec=true
-```
-
-### 一键端到端测试
+## 冒烟测试
 
 ```bash
 cd webrtc_demo
 bash scripts/run_test.sh
 ```
 
-脚本会自动：
+这个脚本会：
 
-- 启动信令服务
+- `go clean -cache`
+- 编译 `signaling` / `sender` / `receiver`
+- 检查二进制是否实际链接到项目内 `libopus`
 - 生成测试音频
-- 启动 receiver/sender 建链并传输
-- 启用模拟丢包并验证 DRED/LBRR/PLC 恢复路径
-- 校验输出 WAV 和统计 JSON
+- 建立 sender -> receiver 的 P2P 会话
+- 输出接收端 WAV 和统计 JSON
 
-### RTC 传输模拟实验矩阵
+## 手动运行
+
+### 1. 启动信令
+
+```bash
+cd webrtc_demo
+go run ./signaling -addr :8090
+```
+
+### 2. 启动接收端
+
+```bash
+cd webrtc_demo
+go run ./receiver \
+  --signal http://127.0.0.1:8090 \
+  --session demo-session \
+  --output /tmp/received.wav \
+  --stats-json /tmp/received_stats.json \
+  --weights ../weights_blob.bin \
+  --duration 8s \
+  --sim-loss 0.10 \
+  --use-lbrr=true \
+  --use-dred=true
+```
+
+### 3. 启动发送端
+
+```bash
+cd webrtc_demo
+go run ./sender \
+  --signal http://127.0.0.1:8090 \
+  --session demo-session \
+  --input ../representative_audio/dialogue/dialogue_30s_48k_mono.wav \
+  --weights ../weights_blob.bin \
+  --bitrate 32000 \
+  --plp 15 \
+  --fec=true \
+  --dred 3
+```
+
+## RTC 实验矩阵
 
 ```bash
 cd webrtc_demo
 
-# 标准实验矩阵（默认：news/dialogue + WER/SER）
+# 标准矩阵
 bash scripts/run_rtc_experiments.sh
 
 # 快速回归
 EXPERIMENT_SUITE=quick bash scripts/run_rtc_experiments.sh
 
-# 完整矩阵（含延迟抖动场景）
+# 完整矩阵
 EXPERIMENT_SUITE=full bash scripts/run_rtc_experiments.sh
 ```
 
-#### 实验矩阵
+### 默认输入
 
-**丢包场景（standard 模式）：**
+脚本固定读取顶层：
 
-| 标识 | 说明 |
-|------|------|
-| `uniform_5` | 均匀 5% 丢包 |
-| `uniform_10` | 均匀 10% 丢包 |
-| `uniform_20` | 均匀 20% 丢包 |
-| `ge_moderate` | GE 中等突发 (p2b=0.05, b2g=0.30, bloss=0.80, 期望≈11%) |
-| `ge_heavy` | GE 重度突发 (p2b=0.10, b2g=0.15, bloss=0.90, 期望≈25%) |
+- `../representative_audio/manifest.txt`
 
-full 模式额外增加 `delay_jitter_10`（均匀 10% + 50ms 延迟 + 20ms 抖动）。
+当前标准集包含：
 
-**保护策略：**
+- `news`
+- `dialogue`
 
-| 标识 | 说明 |
-|------|------|
-| `baseline` | 无保护 (仅 PLC) |
-| `lbrr_only` | LBRR 带内 FEC |
-| `dred_3` | DRED 3 帧冗余 |
-| `dred_5` | DRED 5 帧冗余（standard/full 模式） |
+### 场景
 
-#### 代表性音频
+`standard` 默认场景：
 
-RTC 实验默认直接读取顶层 `representative_audio/manifest.txt` 中的两类基线语音音频：
+- `uniform_5`
+- `uniform_10`
+- `uniform_20`
+- `ge_moderate`
+- `ge_heavy`
 
-- `news`：VOA Learning English 新闻播报片段（固定跳过片头音乐）
-- `dialogue`：ELLLO 真实英文对话片段（附参考文本）
+`full` 在此基础上额外增加：
 
-标准集固定为 30 秒，以便 `SER` 在对话与新闻样本上有足够多的句子可比较。
+- `delay_jitter_10`
 
-#### 实验报告
+### 策略
 
-实验完成后自动生成 `results/rtc_report.md`，包含：
+`standard` / `full` 默认策略：
 
-- **恢复策略对比表**：按音频类型分组，展示各保护方案的 LBRR/DRED/PLC 恢复帧数与恢复率
-- **文本指标表 (WER/SER)**：对比各方案在语音可懂度上的相对退化
-- **音频/转写工件表**：输入 WAV、输出 WAV、参考转写、输出转写、统计 JSON
+- `baseline`
+- `lbrr_only`
+- `dred_3`
+- `dred_5`
 
-输出路径可通过 `REPORT_MD` 环境变量自定义。
+`quick` 默认额外包含：
 
-默认情况下，每次运行都会创建独立产物目录：
+- `adaptive_auto`
 
-- `results/rtc_runs/<RUN_ID>/inputs/`：本次实验使用的代表性输入音频副本
-- `results/rtc_runs/<RUN_ID>/outputs/`：每个音频/场景/策略对应的接收端输出 WAV
-- `results/rtc_runs/<RUN_ID>/stats/`：每个 case 的统计 JSON
-- `results/rtc_runs/<RUN_ID>/rtc_experiment_summary.csv`：本次实验汇总
-- `results/rtc_runs/<RUN_ID>/rtc_report.md`：本次实验报告
+### 常用环境变量
 
-同时会维护两个便捷入口：
+- `EXPERIMENT_SUITE=quick|standard|full`
+- `RUN_ID`
+- `RUN_DIR`
+- `RECV_DURATION`
+- `SIM_SEED`
+- `SENDER_BITRATE`
+- `SENDER_COMPLEXITY`
+- `SENDER_SIGNAL`
+- `SENDER_ADAPTIVE_REDUNDANCY`
+- `SENDER_FEEDBACK_INTERVAL`
+- `SENDER_ADAPT_WINDOW`
+- `EXTRA_DRED_VALUES`
+- `STRATEGY_FILTER`
+- `SCENARIO_FILTER`
+- `ASR_PYTHON`
+- `STT_MODEL`
+- `RTC_STT_BACKEND`
 
-- `results/rtc_report.md`：最新一次实验报告副本
-- `results/rtc_latest`：指向最新一次实验目录的符号链接
+### 典型命令
 
-代表性音频作为仓库内置资产保存在顶层 `representative_audio/`，RTC 实验会把它们复制到每次运行的 `inputs/` 目录。
-WER/SER 报告默认使用仓库下 `.venv_asr/bin/python` 中的 ASR 环境，默认模型为 `small.en`。在 Apple Silicon macOS 上默认优先使用 `mlx-whisper`，其他环境默认使用 `faster-whisper`；也可以通过 `RTC_STT_BACKEND=mlx|faster|auto` 显式指定后端。报告会把干净输入音频的转写结果当作参考文本；若请求的模型在当前后端不可用，脚本会自动回退到可用后端或已缓存模型，避免整轮实验在报告阶段失败。
-如果更关心回归速度而不是识别稳定性，可在运行前覆盖 `STT_MODEL=base.en`。
+只跑固定策略里的 `dred_5`：
 
-### 当前实现说明
+```bash
+cd webrtc_demo
+EXPERIMENT_SUITE=standard \
+STRATEGY_FILTER=dred_5 \
+SCENARIO_FILTER=uniform_10,ge_moderate \
+bash scripts/run_rtc_experiments.sh
+```
 
-- 音频链路固定为 48kHz，发送端将单声道扩展为 Opus 双声道，接收端下混为单声道 WAV。
-- 接收端支持两类“传输损伤”来源：
-  - RTP 序号缺口推断（真实网络丢包）
-  - 内置仿真（均匀丢包 / Gilbert-Elliott / 延迟抖动）
-- 当前实验重点是快速验证 Opus 编码与恢复策略，不包含 STT/LLM/TTS 业务层。
+只跑自适应策略：
+
+```bash
+cd webrtc_demo
+EXPERIMENT_SUITE=quick \
+STRATEGY_FILTER=adaptive_auto \
+SCENARIO_FILTER=uniform_10,ge_moderate \
+bash scripts/run_rtc_experiments.sh
+```
+
+添加额外 DRED 档位：
+
+```bash
+cd webrtc_demo
+EXPERIMENT_SUITE=standard \
+EXTRA_DRED_VALUES=10 \
+bash scripts/run_rtc_experiments.sh
+```
+
+## 输出目录
+
+默认输出到：
+
+```text
+results/rtc_runs/<RUN_ID>/
+├── inputs/
+├── outputs/
+├── stats/
+├── logs/
+├── transcripts/
+├── adaptation/
+├── rtc_experiment_summary.csv
+└── rtc_report.md
+```
+
+同时维护：
+
+- `results/rtc_report.md`
+- `results/rtc_latest`
+
+缓存目录：
+
+- `results/rtc_bin_cache/`
+- `results/rtc_go_cache/`
+
+## 报告链路
+
+`run_rtc_experiments.sh` 结束后会调用顶层 `tools/gen_rtc_report.py`，输出：
+
+- 恢复帧统计
+- 恢复率
+- WER / SER
+- 音频 / 转写 / JSON 工件链接
+
+默认优先使用顶层 `.venv_asr/bin/python`。在 Apple Silicon macOS 上，ASR 后端默认优先 `mlx-whisper`，其他环境默认优先 `faster-whisper`。
+
+## 当前实现特征
+
+- 输入 WAV 约定为 `48kHz / PCM16 / mono`
+- sender 内部会按 Opus 双声道编码链路处理，receiver 最终下混输出单声道 WAV
+- 丢包注入发生在 receiver-side RTP interceptor，而不是 sender 侧伪造“未发送”
+- receiver 同时支持：
+  - RTP 序号缺口推断真实丢包
+  - 内置均匀丢包 / GE / 延迟 / 抖动仿真
+
+## 注意事项
+
+- 如果 `PKG_CONFIG_PATH` 没有指向项目内 `opus-install/lib/pkgconfig`，Go 二进制很容易误链到系统 `libopus`
+- `run_test.sh` 和 `run_rtc_experiments.sh` 会显式校验 sender / receiver 的 `libopus` 链接目标
+- `adaptive_auto` 默认只在 `quick` 套件里出现；如果在 `standard` / `full` 下直接过滤它，结果会是空矩阵
