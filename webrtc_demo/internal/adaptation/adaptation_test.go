@@ -212,6 +212,42 @@ func TestLowBitrateREMBDisablesDRED(t *testing.T) {
 	}
 }
 
+func TestControllerUsesHybridGuardOnBurstShock(t *testing.T) {
+	cfg := DefaultControllerConfig()
+	cfg.Cooling = 0
+	var state ControllerState
+	now := time.Unix(0, 0)
+
+	first := snapshot(now, 0.12, 0.20, true)
+	first.PacketsLostDelta = 4
+	decision, changed := Observe(cfg, &state, first)
+	if !changed {
+		t.Fatalf("expected changed mode")
+	}
+	if decision.Mode != ModeHybridMax || !decision.FEC || decision.DRED != 5 {
+		t.Fatalf("expected hybrid max guard decision, got %+v", decision)
+	}
+}
+
+func TestControllerHybridGuardFallsBackUnderLowREMB(t *testing.T) {
+	cfg := DefaultControllerConfig()
+	cfg.Cooling = 0
+	var state ControllerState
+	now := time.Unix(0, 0)
+
+	first := snapshot(now, 0.12, 0.20, true)
+	first.PacketsLostDelta = 4
+	first.REMBBps = 15000
+	first.HasREMB = true
+	decision, changed := Observe(cfg, &state, first)
+	if !changed {
+		t.Fatalf("expected changed mode")
+	}
+	if decision.Mode != ModeLBRRMedium || decision.DRED != 0 || !decision.FEC {
+		t.Fatalf("expected low remB to force lbrr medium, got %+v", decision)
+	}
+}
+
 func TestEstimateBurstLossRateFromTWCC(t *testing.T) {
 	pkt := &rtcp.TransportLayerCC{
 		PacketStatusCount: 10,

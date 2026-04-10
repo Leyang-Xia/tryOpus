@@ -28,13 +28,15 @@ type FeedbackSnapshot struct {
 type RedundancyMode string
 
 const (
-	ModeOff        RedundancyMode = "off"
-	ModeLBRRMedium RedundancyMode = "lbrr_medium"
-	ModeLBRRHigh   RedundancyMode = "lbrr_high"
-	ModeLBRRUltra  RedundancyMode = "lbrr_ultra"
-	ModeDREDMedium RedundancyMode = "dred_medium"
-	ModeDREDHigh   RedundancyMode = "dred_high"
-	ModeDREDUltra  RedundancyMode = "dred_ultra"
+	ModeOff          RedundancyMode = "off"
+	ModeLBRRMedium   RedundancyMode = "lbrr_medium"
+	ModeLBRRHigh     RedundancyMode = "lbrr_high"
+	ModeLBRRUltra    RedundancyMode = "lbrr_ultra"
+	ModeDREDMedium   RedundancyMode = "dred_medium"
+	ModeDREDHigh     RedundancyMode = "dred_high"
+	ModeDREDUltra    RedundancyMode = "dred_ultra"
+	ModeHybridShield RedundancyMode = "hybrid_shield"
+	ModeHybridMax    RedundancyMode = "hybrid_max"
 )
 
 type RedundancyDecision struct {
@@ -60,6 +62,10 @@ type ControllerConfig struct {
 	LowBitrateDREDPromote   int
 	BurstThreshold          float64
 	BurstLossRatioThreshold float64
+	SevereBurstThreshold    float64
+	BurstShockLossDelta     int
+	JitterGuardSeconds      float64
+	RTTGuardSeconds         float64
 	SupportsDRED            bool
 	BitrateBps              int
 	LowBitrateThresholdBps  int
@@ -279,6 +285,10 @@ func DefaultControllerConfig() ControllerConfig {
 		LowBitrateDREDPromote:   3,
 		BurstThreshold:          0.18,
 		BurstLossRatioThreshold: 0.70,
+		SevereBurstThreshold:    0.26,
+		BurstShockLossDelta:     3,
+		JitterGuardSeconds:      0.040,
+		RTTGuardSeconds:         0.200,
 		SupportsDRED:            true,
 		BitrateBps:              32000,
 		LowBitrateThresholdBps:  24000,
@@ -363,6 +373,29 @@ func shouldAllowLowBitrateDRED(lossEMA, burstEMA float64, hasBurstMetric bool) b
 	return (burstEMA / lossEMA) >= 0.80
 }
 
+func isSevereBurst(lossEMA, burstEMA float64, hasBurstMetric bool, snap FeedbackSnapshot, cfg ControllerConfig) bool {
+	if !hasBurstMetric {
+		return snap.PacketsLostDelta >= cfg.BurstShockLossDelta
+	}
+	if burstEMA >= cfg.SevereBurstThreshold {
+		return true
+	}
+	if snap.PacketsLostDelta >= cfg.BurstShockLossDelta && burstEMA >= cfg.BurstThreshold {
+		return true
+	}
+	return lossEMA >= 0.20 && burstEMA >= 0.24
+}
+
+func shouldUseHybridGuard(lossEMA, jitterEMA, rttEMA float64, snap FeedbackSnapshot, cfg ControllerConfig) bool {
+	if lossEMA < 0.08 {
+		return false
+	}
+	if jitterEMA >= cfg.JitterGuardSeconds || rttEMA >= cfg.RTTGuardSeconds {
+		return true
+	}
+	return snap.PacketsLostDelta >= cfg.BurstShockLossDelta
+}
+
 func maxDREDCap(cfg ControllerConfig, rembBps float64, hasREMB bool) RedundancyMode {
 	tier := bitrateTier(cfg)
 	if tier == "<24k" {
@@ -433,13 +466,36 @@ func capDREDMode(mode, cap RedundancyMode) RedundancyMode {
 	return mode
 }
 
-func decideContext(lossEMA, burstEMA float64, hasBurstMetric bool, snap FeedbackSnapshot, cfg ControllerConfig) decisionContext {
+func applyHybridCap(mode, cap RedundancyMode, lossEMA float64) RedundancyMode {
+	if mode != ModeHybridShield && mode != ModeHybridMax {
+		return mode
+	}
+	switch cap {
+	case ModeOff:
+		if lossEMA >= 0.12 {
+			return ModeLBRRHigh
+		}
+		return ModeLBRRMedium
+	case ModeDREDMedium:
+		return ModeHybridShield
+	case ModeDREDHigh:
+		if mode == ModeHybridMax {
+			return ModeHybridShield
+		}
+		return mode
+	default:
+		return mode
+	}
+}
+
+func decideContext(lossEMA, burstEMA, jitterEMA, rttEMA float64, hasBurstMetric bool, snap FeedbackSnapshot, cfg ControllerConfig) decisionContext {
 	tier := bitrateTier(cfg)
+	dredCap := maxDREDCap(cfg, snap.REMBBps, snap.HasREMB)
 	ctx := decisionContext{
 		BitrateTier:   tier,
 		DecisionClass: "lbrr-first",
 		DREDAllowed:   false,
-		DREDLevelCap:  string(maxDREDCap(cfg, snap.REMBBps, snap.HasREMB)),
+		DREDLevelCap:  string(dredCap),
 	}
 
 	if tier == "<24k" {
@@ -449,6 +505,18 @@ func decideContext(lossEMA, burstEMA float64, hasBurstMetric bool, snap Feedback
 			ctx.DREDAllowed = ctx.Mode != ModeOff && isDREDMode(ctx.Mode)
 		} else {
 			ctx.Mode = decideLBRRMode(lossEMA)
+		}
+		ctx.Mode = applyREMBCap(ctx.Mode, lossEMA, snap.REMBBps, snap.HasREMB, cfg)
+		return ctx
+	}
+
+	if shouldUseHybridGuard(lossEMA, jitterEMA, rttEMA, snap, cfg) && cfg.SupportsDRED {
+		ctx.DecisionClass = "hybrid-guard"
+		ctx.DREDAllowed = dredCap != ModeOff
+		if isSevereBurst(lossEMA, burstEMA, hasBurstMetric, snap, cfg) {
+			ctx.Mode = applyHybridCap(ModeHybridMax, dredCap, lossEMA)
+		} else {
+			ctx.Mode = applyHybridCap(ModeHybridShield, dredCap, lossEMA)
 		}
 		ctx.Mode = applyREMBCap(ctx.Mode, lossEMA, snap.REMBBps, snap.HasREMB, cfg)
 		return ctx
@@ -485,9 +553,9 @@ func modeRank(mode RedundancyMode) int {
 		return 0
 	case ModeLBRRMedium, ModeDREDMedium:
 		return 1
-	case ModeLBRRHigh, ModeDREDHigh:
+	case ModeLBRRHigh, ModeDREDHigh, ModeHybridShield:
 		return 2
-	case ModeLBRRUltra, ModeDREDUltra:
+	case ModeLBRRUltra, ModeDREDUltra, ModeHybridMax:
 		return 3
 	default:
 		return 0
@@ -495,11 +563,15 @@ func modeRank(mode RedundancyMode) int {
 }
 
 func sameFamily(a, b RedundancyMode) bool {
-	return (isDREDMode(a) && isDREDMode(b)) || (!isDREDMode(a) && !isDREDMode(b))
+	return (isDREDLikeMode(a) && isDREDLikeMode(b)) || (!isDREDLikeMode(a) && !isDREDLikeMode(b))
 }
 
 func isDREDMode(mode RedundancyMode) bool {
 	return mode == ModeDREDMedium || mode == ModeDREDHigh || mode == ModeDREDUltra
+}
+
+func isDREDLikeMode(mode RedundancyMode) bool {
+	return isDREDMode(mode) || mode == ModeHybridShield || mode == ModeHybridMax
 }
 
 func modeDecision(mode RedundancyMode, reason string, supportsDRED bool, ctx decisionContext, bitrateBps int) RedundancyDecision {
@@ -527,6 +599,16 @@ func modeDecision(mode RedundancyMode, reason string, supportsDRED bool, ctx dec
 			return modeDecision(ModeLBRRUltra, reason+" (dred unavailable)", supportsDRED, ctx, bitrateBps)
 		}
 		return RedundancyDecision{Mode: mode, FEC: false, PLP: 20, DRED: 10, Reason: reason, BitrateBps: bitrateBps, BitrateTier: ctx.BitrateTier, DecisionClass: ctx.DecisionClass, DREDAllowed: ctx.DREDAllowed, DREDLevelCap: ctx.DREDLevelCap}
+	case ModeHybridShield:
+		if !supportsDRED {
+			return modeDecision(ModeLBRRHigh, reason+" (dred unavailable)", supportsDRED, ctx, bitrateBps)
+		}
+		return RedundancyDecision{Mode: mode, FEC: true, PLP: 15, DRED: 3, Reason: reason, BitrateBps: bitrateBps, BitrateTier: ctx.BitrateTier, DecisionClass: ctx.DecisionClass, DREDAllowed: ctx.DREDAllowed, DREDLevelCap: ctx.DREDLevelCap}
+	case ModeHybridMax:
+		if !supportsDRED {
+			return modeDecision(ModeLBRRUltra, reason+" (dred unavailable)", supportsDRED, ctx, bitrateBps)
+		}
+		return RedundancyDecision{Mode: mode, FEC: true, PLP: 20, DRED: 5, Reason: reason, BitrateBps: bitrateBps, BitrateTier: ctx.BitrateTier, DecisionClass: ctx.DecisionClass, DREDAllowed: ctx.DREDAllowed, DREDLevelCap: ctx.DREDLevelCap}
 	default:
 		return RedundancyDecision{Mode: ModeOff, FEC: false, PLP: 0, DRED: 0, Reason: reason, BitrateBps: bitrateBps, BitrateTier: ctx.BitrateTier, DecisionClass: ctx.DecisionClass, DREDAllowed: ctx.DREDAllowed, DREDLevelCap: ctx.DREDLevelCap}
 	}
@@ -556,7 +638,7 @@ func Observe(cfg ControllerConfig, state *ControllerState, snap FeedbackSnapshot
 		}
 	}
 
-	ctx := decideContext(state.LossEMA, state.BurstEMA, snap.HasBurstMetric, snap, cfg)
+	ctx := decideContext(state.LossEMA, state.BurstEMA, state.JitterEMA, state.RTTEMA, snap.HasBurstMetric, snap, cfg)
 	target := ctx.Mode
 
 	if state.LastMode == "" {
